@@ -1,0 +1,478 @@
+import datetime
+import pandas as pd
+import numpy as np
+
+# In your environment, make sure kiteconnect is installed:
+# pip install kiteconnect
+try:
+    from kiteconnect import KiteConnect
+except ImportError:
+    KiteConnect = None
+
+
+# ========== CONFIG ==========
+API_KEY = "vf8jjkj3pzp65dsm"                # <-- put your real API key
+ACCESS_TOKEN = "KYnVfs483Nqiio1lLaVgs1DRtlcLg8bq"      # <-- your access token
+# Index tokens (verify from instruments dump if needed)
+NIFTY50_TOKEN = 256265
+BANKNIFTY_TOKEN = 260105
+
+FROM_DATE = datetime.datetime(2022, 1, 1, 9, 15)
+TO_DATE = datetime.datetime(2022, 12, 3, 15, 30)
+INTERVAL = "5minute"
+
+# Where to save the trades CSV
+TRADES_CSV_PATH = "ema_scalping_trade1s.csv"
+
+
+# ========== KITE HELPERS ==========
+
+def get_kite_client(api_key: str, access_token: str):
+    """Initialise Kite client with an existing access token."""
+    if KiteConnect is None:
+        raise ImportError("kiteconnect is not installed. Run: pip install kiteconnect")
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    return kite
+
+
+def fetch_historical_df(
+    kite,
+    instrument_token: int,
+    from_date: datetime.datetime,
+    to_date: datetime.datetime,
+    interval: str = "5minute",
+    max_days_per_call: int = 60,
+) -> pd.DataFrame:
+    """
+    Fetch historical data in chunks (Kite limits how much you can pull at once).
+    """
+    all_records = []
+    start = from_date
+    delta = datetime.timedelta(days=max_days_per_call)
+
+    while start < to_date:
+        end = min(start + delta, to_date)
+        print(f"Fetching token={instrument_token} from {start} to {end} ...")
+
+        batch = kite.historical_data(
+            instrument_token=instrument_token,
+            from_date=start,
+            to_date=end,
+            interval=interval,
+            continuous=False,
+            oi=False,
+        )
+        all_records.extend(batch)
+        start = end + datetime.timedelta(seconds=1)
+
+    if not all_records:
+        raise ValueError(f"No historical data returned for token {instrument_token}")
+
+    df = pd.DataFrame(all_records)
+    df = df.sort_values("date").reset_index(drop=True)
+    df.set_index("date", inplace=True)
+    return df
+
+
+def load_and_prepare_data_from_kite(
+    kite,
+    nifty_token: int,
+    banknifty_token: int,
+    from_date: datetime.datetime,
+    to_date: datetime.datetime,
+    interval: str = "5minute",
+) -> pd.DataFrame:
+    """
+    Fetch NIFTY & BANKNIFTY and align them on timestamp.
+    """
+    df_n = fetch_historical_df(kite, nifty_token, from_date, to_date, interval)
+    df_bn = fetch_historical_df(kite, banknifty_token, from_date, to_date, interval)
+
+    df_n = df_n.rename(
+        columns={
+            "open": "n_open",
+            "high": "n_high",
+            "low": "n_low",
+            "close": "n_close",
+            "volume": "n_volume",
+        }
+    )
+    df_bn = df_bn.rename(
+        columns={
+            "open": "bn_open",
+            "high": "bn_high",
+            "low": "bn_low",
+            "close": "bn_close",
+            "volume": "bn_volume",
+        }
+    )
+
+    df = df_n.join(
+        df_bn[["bn_open", "bn_high", "bn_low", "bn_close", "bn_volume"]],
+        how="inner",
+    )
+    df = df.sort_index()
+    return df
+
+
+# ========== INDICATORS & SIGNALS ==========
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Looser / more realistic implementation of your rules,
+    so that signals actually appear while still following your logic:
+    - 9/15 EMA trend
+    - candle rejection at EMAs
+    - BankNifty not giving clear opposite signal
+    """
+    df = df.copy()
+
+    # ---------- NIFTY EMAs ----------
+    df["ema9"] = df["n_close"].ewm(span=9, adjust=False).mean()
+    df["ema15"] = df["n_close"].ewm(span=15, adjust=False).mean()
+
+    # Approximate "angle" by direction over last 3 candles
+    df["ema9_slope"] = df["ema9"] - df["ema9"].shift(3)
+    df["ema15_slope"] = df["ema15"] - df["ema15"].shift(3)
+
+    # Trend up: 9 EMA above 15 EMA and both rising
+    df["bull_trend"] = (
+        (df["ema9"] > df["ema15"]) &
+        (df["ema9_slope"] > 0) &
+        (df["ema15_slope"] > 0)
+    )
+
+    # ---------- NIFTY candle stats ----------
+    n_open = df["n_open"]
+    n_high = df["n_high"]
+    n_low = df["n_low"]
+    n_close = df["n_close"]
+
+    df["n_range"] = n_high - n_low
+    df["n_body"] = (n_close - n_open).abs()
+    df["n_upper_wick"] = n_high - np.maximum(n_open, n_close)
+    df["n_lower_wick"] = np.minimum(n_open, n_close) - n_low
+
+    small = 1e-8
+    df["n_range"] = df["n_range"].replace(0, small)
+
+    df["n_body_mean_20"] = df["n_body"].rolling(window=20, min_periods=20).mean()
+
+    # 1) Bullish pin bar (slightly relaxed)
+    df["bull_pin"] = (
+        (n_close > n_open) &
+        (df["n_lower_wick"] >= 0.5 * df["n_range"]) &
+        (df["n_body"] <= 0.4 * df["n_range"])
+    )
+
+    # 2) Full body candle (relaxed from 0.6 to 0.5)
+    df["bull_full_body"] = (
+        (n_close > n_open) &
+        (df["n_body"] >= 0.5 * df["n_range"])
+    )
+
+    # 3) Big body relative to recent average (relaxed factor)
+    df["bull_big_body"] = (
+        (n_close > n_open) &
+        (df["n_body_mean_20"].notna()) &
+        (df["n_body"] >= 1.2 * df["n_body_mean_20"])
+    )
+
+    df["bullish_pattern"] = df["bull_pin"] | df["bull_full_body"] | df["bull_big_body"]
+
+    # Interaction with EMAs (price interacts + closes above)
+    df["touch_emas"] = (n_low <= df["ema9"]) | (n_low <= df["ema15"])
+    df["close_above_emas"] = (n_close > df["ema9"]) & (n_close > df["ema15"])
+
+    df["bullish_entry_raw"] = (
+        df["bull_trend"] &
+        df["touch_emas"] &
+        df["close_above_emas"] &
+        df["bullish_pattern"]
+    )
+
+    # ---------- BANKNIFTY confirmation (simplified) ----------
+    bn_open = df["bn_open"]
+    bn_close = df["bn_close"]
+
+    # EMAs on BankNifty
+    df["bn_ema9"] = bn_close.ewm(span=9, adjust=False).mean()
+    df["bn_ema15"] = bn_close.ewm(span=15, adjust=False).mean()
+    df["bn_ema9_slope"] = df["bn_ema9"] - df["bn_ema9"].shift(3)
+    df["bn_ema15_slope"] = df["bn_ema15"] - df["bn_ema15"].shift(3)
+
+    df["bn_bull_trend"] = (
+        (df["bn_ema9"] > df["bn_ema15"]) &
+        (df["bn_ema9_slope"] > 0) &
+        (df["bn_ema15_slope"] > 0)
+    )
+    df["bn_bear_trend"] = (
+        (df["bn_ema9"] < df["bn_ema15"]) &
+        (df["bn_ema9_slope"] < 0) &
+        (df["bn_ema15_slope"] < 0)
+    )
+
+    df["bn_bullish_candle"] = bn_close > bn_open
+    df["bn_bearish_candle"] = bn_close < bn_open
+
+    # "Contradictory" = BankNifty in clear downtrend + bearish candle
+    df["bank_contradiction_short"] = df["bn_bear_trend"] & df["bn_bearish_candle"]
+
+    # We only require that there is no such clear short signal on BN
+    df["bank_ok_for_long"] = ~df["bank_contradiction_short"]
+
+    # Final long signal
+    df["long_signal"] = df["bullish_entry_raw"] & df["bank_ok_for_long"]
+
+    # ---------- Bearish reversal (for early exit) ----------
+    df["bear_full_body"] = (
+        (n_close < n_open) &
+        (df["n_body"] >= 0.5 * df["n_range"])
+    )
+    df["bear_big_body"] = (
+        (n_close < n_open) &
+        (df["n_body_mean_20"].notna()) &
+        (df["n_body"] >= 1.2 * df["n_body_mean_20"])
+    )
+    df["bearish_reversal"] = df["bear_full_body"] | df["bear_big_body"]
+
+    return df
+
+
+# ========== BACKTEST ENGINE ==========
+
+def backtest_scalping_ema_strategy(
+    df: pd.DataFrame,
+    initial_capital: float = 30000.0,
+    risk_per_trade_pct: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Backtest your EMA scalping logic (long-only).
+
+    Simplifications:
+      - Entry at NEXT candle open after signal.
+      - SL = low of signal candle.
+      - TP = entry + 2 * risk (1:2 RR).
+      - Early exit if bearish reversal candle appears before SL/TP.
+      - Exit at end-of-day if trade still open.
+    """
+    df = df.copy()
+    df["date"] = df.index.date
+
+    trades = []
+    position = None
+
+    # Start after indicators are valid (no NaNs)
+    first_valid_idx = df.dropna().index[0]
+    start_index = df.index.get_loc(first_valid_idx)
+    idx = list(df.index)
+
+    for i in range(start_index, len(df) - 1):
+        row = df.iloc[i]
+        current_time = idx[i]
+        next_time = idx[i + 1]
+
+        if position is None:
+            # Look for fresh long signal
+            if row["long_signal"]:
+                next_row = df.iloc[i + 1]
+                entry_price = float(next_row["n_open"])
+                sl_price = float(row["n_low"])
+
+                # Skip if SL >= entry (invalid)
+                if sl_price >= entry_price:
+                    continue
+
+                risk_per_unit = entry_price - sl_price
+                capital = initial_capital if not trades else trades[-1]["equity_after"]
+                rupees_risk = capital * (risk_per_trade_pct / 100.0)
+                qty = max(int(rupees_risk // risk_per_unit), 1)
+
+                tp_price = entry_price + 2 * risk_per_unit
+
+                position = {
+                    "side": "long",
+                    "entry_idx": i + 1,
+                    "entry_time": next_time,
+                    "entry_price": entry_price,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
+                    "qty": qty,
+                    "risk_rupees": risk_per_unit * qty,
+                    "signal_time": current_time,
+                }
+        else:
+            # Manage open position
+            if i <= position["entry_idx"]:
+                continue
+
+            row = df.iloc[i]
+            bar_time = idx[i]
+            low = float(row["n_low"])
+            high = float(row["n_high"])
+            close = float(row["n_close"])
+
+            sl = position["sl_price"]
+            tp = position["tp_price"]
+
+            exit_price = None
+            exit_reason = None
+
+            # 1) SL / TP hits (SL first if both same bar)
+            if (low <= sl) and (high >= tp):
+                exit_price = sl
+                exit_reason = "SL_and_TP_same_bar_SL_first"
+            elif low <= sl:
+                exit_price = sl
+                exit_reason = "SL"
+            elif high >= tp:
+                exit_price = tp
+                exit_reason = "TP"
+
+            # 2) Bearish reversal exit
+            if exit_price is None and row["bearish_reversal"]:
+                exit_price = close
+                exit_reason = "bearish_reversal_exit"
+
+            # 3) End-of-day exit
+            if exit_price is None and i + 1 < len(df):
+                next_date = df["date"].iloc[i + 1]
+                if next_date != row["date"]:
+                    exit_price = close
+                    exit_reason = "end_of_day_exit"
+
+            # Record trade if exited
+            if exit_price is not None:
+                qty = position["qty"]
+                if position["side"] == "long":
+                    pnl = (exit_price - position["entry_price"]) * qty
+                else:
+                    pnl = (position["entry_price"] - exit_price) * qty
+
+                prev_equity = initial_capital if not trades else trades[-1]["equity_after"]
+                equity_after = prev_equity + pnl
+                r_multiple = pnl / position["risk_rupees"] if position["risk_rupees"] != 0 else np.nan
+
+                trades.append(
+                    {
+                        "side": position["side"],
+                        "signal_time": position["signal_time"],
+                        "entry_time": position["entry_time"],
+                        "exit_time": bar_time,
+                        "entry_price": position["entry_price"],
+                        "exit_price": exit_price,
+                        "sl_price": position["sl_price"],
+                        "tp_price": position["tp_price"],
+                        "qty": qty,
+                        "pnl": pnl,
+                        "r_multiple": r_multiple,
+                        "exit_reason": exit_reason,
+                        "equity_after": equity_after,
+                    }
+                )
+                position = None
+
+    # Close at end of backtest if still open
+    if position is not None:
+        last_row = df.iloc[-1]
+        last_time = idx[-1]
+        close = float(last_row["n_close"])
+        qty = position["qty"]
+        if position["side"] == "long":
+            pnl = (close - position["entry_price"]) * qty
+        else:
+            pnl = (position["entry_price"] - close) * qty
+        prev_equity = initial_capital if not trades else trades[-1]["equity_after"]
+        equity_after = prev_equity + pnl
+        r_multiple = pnl / position["risk_rupees"] if position["risk_rupees"] != 0 else np.nan
+
+        trades.append(
+            {
+                "side": position["side"],
+                "signal_time": position["signal_time"],
+                "entry_time": position["entry_time"],
+                "exit_time": last_time,
+                "entry_price": position["entry_price"],
+                "exit_price": close,
+                "sl_price": position["sl_price"],
+                "tp_price": position["tp_price"],
+                "qty": qty,
+                "pnl": pnl,
+                "r_multiple": r_multiple,
+                "exit_reason": "end_of_backtest_exit",
+                "equity_after": equity_after,
+            }
+        )
+
+    return pd.DataFrame(trades)
+
+
+def summarize_backtest(trades_df: pd.DataFrame, initial_capital: float = 30000.0):
+    if trades_df.empty:
+        print("No trades were taken.")
+        return
+
+    total_trades = len(trades_df)
+    wins = (trades_df["pnl"] > 0).sum()
+    losses = (trades_df["pnl"] < 0).sum()
+    win_rate = wins / total_trades * 100.0
+    avg_r = trades_df["r_multiple"].mean()
+    total_pnl = trades_df["pnl"].sum()
+    final_equity = trades_df["equity_after"].iloc[-1]
+
+    equity_curve = trades_df["equity_after"]
+    running_max = equity_curve.cummax()
+    drawdown = equity_curve - running_max
+    max_dd = drawdown.min()
+
+    print("===== Backtest Summary =====")
+    print(f"Initial capital:    {initial_capital:.2f}")
+    print(f"Final equity:       {final_equity:.2f}")
+    print(f"Total PnL:          {total_pnl:.2f}")
+    print(f"Total trades:       {total_trades}")
+    print(f"Wins:               {wins}")
+    print(f"Losses:             {losses}")
+    print(f"Win rate:           {win_rate:.2f}%")
+    print(f"Average R multiple: {avg_r:.2f}")
+    print(f"Max drawdown:       {max_dd:.2f}")
+
+    print("\nSample trades:")
+    print(trades_df.head())
+
+
+if __name__ == "__main__":
+    # 1. Fill API_KEY and ACCESS_TOKEN at the top.
+    # 2. Make sure your Kite app has historical data enabled.
+    # 3. Adjust FROM_DATE / TO_DATE if needed.
+
+    kite = get_kite_client(API_KEY, ACCESS_TOKEN)
+
+    data = load_and_prepare_data_from_kite(
+        kite,
+        nifty_token=NIFTY50_TOKEN,
+        banknifty_token=BANKNIFTY_TOKEN,
+        from_date=FROM_DATE,
+        to_date=TO_DATE,
+        interval=INTERVAL,
+    )
+
+    data = add_indicators(data)
+
+    # Quick sanity check: how many signal candles?
+    print("bullish_entry_raw count:", data["bullish_entry_raw"].sum())
+    print("long_signal count:      ", data["long_signal"].sum())
+
+    trades = backtest_scalping_ema_strategy(
+        data,
+        initial_capital=30000.0,
+        risk_per_trade_pct=1.0,
+    )
+    summarize_backtest(trades, initial_capital=30000.0)
+
+    # Save trades to CSV
+    if not trades.empty:
+        trades.to_csv(TRADES_CSV_PATH, index=False)
+        print(f"\nTrades saved to: {TRADES_CSV_PATH}")
+    else:
+        print("\nNo trades to save; trades DataFrame is empty.")

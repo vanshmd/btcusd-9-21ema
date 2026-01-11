@@ -1,0 +1,1068 @@
+"""
+Delta Exchange LIVE Bot — EMA Pullback Strategy + Fixed Filters + Candle-Close Chandelier
+
+Implements:
+- EMA pullback signals (EMA9/EMA15 + EMA200 filter + slope/angle/separation + no-recent-cross)
+- Fixed filters:
+    * skip 01:00–07:00 IST (both sides)
+    * RSI slope: long only if rsi_slope > 0, short only if rsi_slope < 0
+- Entry:
+    * Long: break of signal candle HIGH (stop-entry)
+    * Short: break of signal candle LOW
+    * Entry order valid ONLY for the NEXT candle (matches your backtest)
+- One position at a time
+- Exits:
+    * Strict initial SL = signal candle LOW (long) / HIGH (short)
+    * Chandelier ATR trailing SL (ATR14, mult=1.0) updated ONLY on candle close
+    * Active stop = max(strict, chandelier) for long; min(strict, chandelier) for short
+    * TP = 5R (limit order)
+    * Early exit: 3 consecutive closes against EMA9 (market exit at candle close)
+
+Notes:
+- Uses Delta REST API authentication (HMAC signature).
+- Uses exchange stop orders for protection, but trailing logic is computed by the bot at candle close.
+- Make sure your account supports the product and leverage you set.
+
+NOT financial advice. Use at your own risk.
+"""
+
+import hashlib
+import hmac
+import json
+import math
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+from urllib.parse import urlencode
+
+
+# =========================
+# CONFIG (EDIT THESE)
+# =========================
+
+# ---- Broker / API ----
+DELTA_BASE_URL = "https://api.delta.exchange"   # or India: https://api.india.delta.exchange (if applicable)
+API_KEY = ""       # <-- put your key
+API_SECRET = ""    # <-- put your secret
+USER_AGENT = "ema-pullback-live-bot"
+
+# ---- Trading ----
+SYMBOL = "BTCUSD"
+RESOLUTION = "5m"
+
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))  # IST
+
+# Capital deployed & leverage (as requested)
+CAPITAL_DEPLOYED_USD = 1000.0
+LEVERAGE = 100.0
+
+# Risk sizing (still used unless you choose FULL_LEVERAGE_MODE)
+RISK_PER_TRADE = 0.01  # 1% of CAPITAL_DEPLOYED_USD
+FULL_LEVERAGE_MODE = False  # True => uses max notional = capital*leverage (VERY risky)
+
+# ---- Strategy params (same as your backtest) ----
+EMA_SHORT = 9
+EMA_LONG = 15
+EMA_TREND_FILTER = 200
+EMA_9_200_MIN_DIST = 0.003
+
+EMA_SLOPE_LOOKBACK = 3
+MIN_SLOPE_PCT = 0.0001
+EMA_LONG_MIN_ANGLE_DEG = 33.0
+EMA_LONG_ANGLE_SCALE = 500.0
+MIN_EMA_SEPARATION_PCT = 0.0003
+CROSS_LOOKBACK = 10
+
+# Candle pattern params
+PINBAR_WICK_RATIO = 1.2
+PINBAR_MAX_WICK_BODY_RATIO = 1.2
+STRONG_BODY_MIN_BODY_TO_RANGE = 0.4
+
+# Filters (fixed)
+SKIP_START_MINUTE = 1 * 60    # 01:00
+SKIP_END_MINUTE   = 7 * 60    # 07:00
+
+# Trade management
+TP_R_MULTIPLE = 5.0
+
+TRAIL_ATR_MULT = 1.0          # chandelier = HH - ATR*mult (long), LL + ATR*mult (short)
+LOSS_EMA_N = 3                # early exit: 3 closes against EMA9
+
+# Stop trigger method for stop orders on Delta (you can change)
+STOP_TRIGGER_METHOD = "mark_price"  # or "last_traded_price" depending on preference
+
+# Costs are not used in live execution; exchange fees/slippage are real and vary.
+
+# ---- Bot behavior ----
+LOOKBACK_BARS = 600              # candles to fetch each update (>= 250 recommended for EMA200 stability)
+POLL_SECONDS = 3                 # polling interval
+DRY_RUN = True                   # True => no real orders; prints what it would do
+
+# Safety limits
+MAX_SPREAD_PCT = 0.01            # if you add orderbook checks later
+MAX_ORDER_RETRIES = 3
+REQUEST_TIMEOUT = (5, 30)
+
+
+# =========================
+# HELPERS
+# =========================
+
+def resolution_to_seconds(res: str) -> int:
+    r = res.strip().lower()
+    unit = r[-1]
+    val = int(r[:-1])
+    if unit == "m":
+        return val * 60
+    if unit == "h":
+        return val * 3600
+    if unit == "d":
+        return val * 86400
+    raise ValueError(f"Unsupported resolution: {res}")
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def floor_time_to_tf_epoch(ts: float, tf_seconds: int) -> int:
+    return int(ts // tf_seconds) * tf_seconds
+
+
+def last_closed_candle_end_epoch(tf_seconds: int) -> int:
+    """
+    Returns an inclusive end epoch (seconds) that should exclude the currently-forming candle.
+    Example: If now is 10:07 on 5m, current candle started 10:05 (still forming),
+    last closed candle ended at 10:04:59.
+    """
+    boundary = floor_time_to_tf_epoch(time.time(), tf_seconds)
+    return boundary - 1
+
+
+def floor_to_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        return price
+    q = price / tick
+    qf = math.floor(q + 1e-12)
+    return round(qf * tick, 8)
+
+
+def ceil_to_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        return price
+    q = price / tick
+    qc = math.ceil(q - 1e-12)
+    return round(qc * tick, 8)
+
+
+def fmt_price(p: float) -> str:
+    # Delta accepts strings for prices; keep reasonable precision.
+    return f"{p:.8f}".rstrip("0").rstrip(".")
+
+
+# =========================
+# DELTA CLIENT
+# =========================
+
+class DeltaClient:
+    def __init__(self, base_url: str, api_key: str, api_secret: str, user_agent: str = USER_AGENT):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": user_agent, "Content-Type": "application/json"})
+
+    def _sign(self, method: str, path: str, params: Optional[Dict[str, Any]], body_str: str, timestamp: str) -> str:
+        qs = ""
+        if params:
+            qs = "?" + urlencode(params, doseq=True)
+        message = method.upper() + timestamp + path + qs + body_str
+        return hmac.new(self.api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        auth: bool = False,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        params = params or {}
+        payload = payload or {}
+
+        body_str = json.dumps(payload, separators=(",", ":")) if payload else ""
+        headers = {}
+
+        if auth:
+            if not self.api_key or not self.api_secret:
+                raise RuntimeError("API_KEY/API_SECRET not set but auth=True requested.")
+            ts = str(int(time.time()))
+            sig = self._sign(method, path, params, body_str, ts)
+            headers.update({"api-key": self.api_key, "timestamp": ts, "signature": sig})
+
+        resp = self.session.request(
+            method=method.upper(),
+            url=url,
+            params=params if params else None,
+            data=body_str if method.upper() != "GET" else None,
+            headers=headers if headers else None,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and data.get("success") is False:
+            raise RuntimeError(f"Delta API error: {data.get('error')} | {data.get('message')}")
+        # Most endpoints wrap in {"success":true,"result":...}
+        return data.get("result", data)
+
+    # ---- Public ----
+    def get_products(self) -> List[Dict[str, Any]]:
+        return self.request("GET", "/v2/products", auth=False)
+
+    def get_product_by_symbol(self, symbol: str) -> Dict[str, Any]:
+        products = self.get_products()
+        for p in products:
+            if p.get("symbol") == symbol:
+                return p
+        raise RuntimeError(f"Product symbol not found: {symbol}")
+
+    def get_candles(self, symbol: str, resolution: str, start: int, end: int) -> List[Dict[str, Any]]:
+        return self.request(
+            "GET",
+            "/v2/history/candles",
+            params={"symbol": symbol, "resolution": resolution, "start": start, "end": end},
+            auth=False,
+        )
+
+    # ---- Private ----
+    def get_positions(self) -> List[Dict[str, Any]]:
+        return self.request("GET", "/v2/positions", auth=True)
+
+    def get_orders(self, product_id: int, state: str = "open") -> List[Dict[str, Any]]:
+        return self.request("GET", "/v2/orders", params={"product_id": product_id, "state": state}, auth=True)
+
+    def place_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
+        # Delta often accepts single JSON object; some swagger variants show arrays.
+        # If your account expects array, wrap manually: payload=[order]
+        return self.request("POST", "/v2/orders", payload=order, auth=True)
+
+    def edit_order(self, order_id: int, product_id: int, fields: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {"id": order_id, "product_id": product_id}
+        payload.update(fields)
+        return self.request("PUT", "/v2/orders", payload=payload, auth=True)
+
+    def cancel_order(self, order_id: int) -> Dict[str, Any]:
+        return self.request("DELETE", "/v2/orders", payload={"id": order_id}, auth=True)
+
+    def cancel_all_orders(self, product_id: int) -> Any:
+        # If this endpoint behaves differently on your account, comment it out and cancel individually.
+        return self.request("DELETE", "/v2/orders/all", payload={"product_id": product_id}, auth=True)
+
+    def set_orders_leverage(self, product_id: int, leverage: float) -> Any:
+        # Endpoint exists in Delta API for changing leverage of open orders for a product.
+        return self.request(
+            "POST",
+            f"/v2/products/{product_id}/orders/leverage",
+            payload={"leverage": leverage},
+            auth=True,
+        )
+
+
+# =========================
+# INDICATORS (same logic as your backtest)
+# =========================
+
+def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / window, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / window, adjust=False).mean()
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    close = df["close"]
+
+    df["ema_short"] = close.ewm(span=EMA_SHORT, adjust=False).mean()
+    df["ema_long"]  = close.ewm(span=EMA_LONG,  adjust=False).mean()
+    df["ema_200"]   = close.ewm(span=EMA_TREND_FILTER, adjust=False).mean()
+
+    ema_long_prev = df["ema_long"].shift(EMA_SLOPE_LOOKBACK)
+    slope_long_pct = (df["ema_long"] - ema_long_prev) / ema_long_prev
+    df["slope_long_pct"] = slope_long_pct
+    df["ema_long_angle_deg"] = np.degrees(np.arctan(slope_long_pct * EMA_LONG_ANGLE_SCALE))
+
+    df["ema_sep_pct"] = (df["ema_short"] - df["ema_long"]).abs() / df["close"].replace(0.0, np.nan)
+
+    df["ema_diff_sign"] = np.sign(df["ema_short"] - df["ema_long"])
+    df["ema_cross"] = df["ema_diff_sign"].ne(df["ema_diff_sign"].shift(1))
+    df["recent_cross"] = df["ema_cross"].rolling(CROSS_LOOKBACK).max().fillna(0).astype(bool)
+
+    df["long_trend"] = (
+        (df["ema_short"] > df["ema_long"]) &
+        (df["slope_long_pct"] > MIN_SLOPE_PCT) &
+        (df["ema_long_angle_deg"] >= EMA_LONG_MIN_ANGLE_DEG) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    df["short_trend"] = (
+        (df["ema_short"] < df["ema_long"]) &
+        (df["slope_long_pct"] < -MIN_SLOPE_PCT) &
+        (df["ema_long_angle_deg"] <= -EMA_LONG_MIN_ANGLE_DEG) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    df["rsi_14"] = compute_rsi(close, 14)
+    df["rsi_slope"] = df["rsi_14"] - df["rsi_14"].shift(1)
+
+    df["atr_14"] = compute_atr(df["high"], df["low"], close, 14)
+    df["dist_9_200"] = (df["ema_short"] - df["ema_200"]).abs() / close.replace(0.0, np.nan)
+
+    idx = df.index
+    df["minute_of_day"] = idx.hour * 60 + idx.minute
+
+    return df
+
+
+def build_base_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+
+    body = (c - o).abs()
+    rng = (h - l)
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
+
+    is_bull = c > o
+    is_bear = c < o
+
+    bullish_pinbar = (
+        is_bull &
+        (body > 0) &
+        (lower_wick >= PINBAR_WICK_RATIO * body) &
+        (upper_wick <= PINBAR_MAX_WICK_BODY_RATIO * body)
+    )
+    bearish_pinbar = (
+        is_bear &
+        (body > 0) &
+        (upper_wick >= PINBAR_WICK_RATIO * body) &
+        (lower_wick <= PINBAR_MAX_WICK_BODY_RATIO * body)
+    )
+
+    strong_bull = is_bull & (rng > 0) & ((body / rng) >= STRONG_BODY_MIN_BODY_TO_RANGE)
+    strong_bear = is_bear & (rng > 0) & ((body / rng) >= STRONG_BODY_MIN_BODY_TO_RANGE)
+
+    ema_s = df["ema_short"]
+    ema_l = df["ema_long"]
+    ema200 = df["ema_200"]
+    dist_9_200 = df["dist_9_200"]
+
+    touches = ((l <= ema_s) & (ema_s <= h)) | ((l <= ema_l) & (ema_l <= h))
+    ok = ~(ema_s.isna() | ema_l.isna() | ema200.isna() | c.isna())
+
+    long_signal_raw = (
+        ok &
+        df["long_trend"] &
+        touches &
+        (ema_s > ema200) &
+        (dist_9_200 >= EMA_9_200_MIN_DIST) &
+        (c > ema_s) & (c > ema_l) &
+        (bullish_pinbar | strong_bull | is_bull)
+    )
+    short_signal_raw = (
+        ok &
+        df["short_trend"] &
+        touches &
+        (ema200 > ema_s) &
+        (dist_9_200 >= EMA_9_200_MIN_DIST) &
+        (c < ema_s) & (c < ema_l) &
+        (bearish_pinbar | strong_bear | is_bear)
+    )
+
+    df["long_signal_raw"] = long_signal_raw.fillna(False)
+    df["short_signal_raw"] = short_signal_raw.fillna(False)
+    return df
+
+
+# =========================
+# BOT STATE
+# =========================
+
+@dataclass
+class ProductInfo:
+    product_id: int
+    symbol: str
+    contract_value_btc: float  # e.g., 0.001 BTC per contract
+    tick_size: float           # e.g., 0.5 USD
+
+
+@dataclass
+class PendingEntry:
+    side: str                   # "long" or "short"
+    signal_candle_time: pd.Timestamp
+    expiry_candle_time: pd.Timestamp
+    entry_price: float
+    strict_stop: float
+    risk_per_unit: float
+    target: float
+    size_contracts: int
+    entry_order_id: Optional[int] = None
+
+
+class LiveBot:
+    def __init__(self, client: DeltaClient, product: ProductInfo, tf_seconds: int):
+        self.client = client
+        self.product = product
+        self.tf_seconds = tf_seconds
+
+        self.pending: Optional[PendingEntry] = None
+
+        # Position state
+        self.in_position = False
+        self.side: Optional[str] = None          # "long" or "short"
+        self.size_contracts: int = 0
+        self.entry_price: float = 0.0
+        self.strict_stop: float = 0.0
+        self.current_stop: float = 0.0
+        self.target: float = 0.0
+
+        self.stop_order_id: Optional[int] = None
+        self.tp_order_id: Optional[int] = None
+
+        # trailing state
+        self.hh_since: float = 0.0
+        self.ll_since: float = 0.0
+
+        # early exit
+        self.ema_against_count: int = 0
+
+    # ---------- sizing ----------
+    def _max_contracts_by_margin(self, entry_price: float) -> int:
+        # Max notional = capital * leverage
+        max_notional = CAPITAL_DEPLOYED_USD * LEVERAGE
+        if entry_price <= 0 or self.product.contract_value_btc <= 0:
+            return 0
+        max_size_btc = max_notional / entry_price
+        max_contracts = int(math.floor(max_size_btc / self.product.contract_value_btc))
+        return max(0, max_contracts)
+
+    def _contracts_from_risk(self, risk_per_unit: float) -> int:
+        if risk_per_unit <= 0 or self.product.contract_value_btc <= 0:
+            return 0
+        risk_amount = CAPITAL_DEPLOYED_USD * RISK_PER_TRADE
+        size_btc = risk_amount / risk_per_unit
+        contracts = int(math.floor(size_btc / self.product.contract_value_btc))
+        return max(0, contracts)
+
+    def _compute_entry_size_contracts(self, entry_price: float, risk_per_unit: float) -> int:
+        max_contracts = self._max_contracts_by_margin(entry_price)
+        if FULL_LEVERAGE_MODE:
+            return max_contracts
+
+        risk_contracts = self._contracts_from_risk(risk_per_unit)
+        return min(risk_contracts, max_contracts)
+
+    # ---------- exchange sync ----------
+    def _find_product_position(self, positions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for p in positions:
+            # Different accounts may use product_id or product symbol fields
+            if p.get("product_id") == self.product.product_id or p.get("product", {}).get("id") == self.product.product_id:
+                return p
+        return None
+
+    def sync_with_exchange(self) -> None:
+        """
+        Keeps bot state aligned with exchange:
+        - Detects if position exists
+        - Cancels stale entry orders
+        - Clears state if position is closed
+        """
+        if DRY_RUN:
+            return
+
+        # 1) positions
+        positions = self.client.get_positions()
+        pos = self._find_product_position(positions)
+
+        pos_size = 0.0
+        entry_price = None
+
+        if pos:
+            # Try common field names
+            for k in ("size", "position_size", "net_size", "quantity"):
+                if k in pos and pos[k] is not None:
+                    try:
+                        pos_size = float(pos[k])
+                        break
+                    except Exception:
+                        pass
+            for k in ("entry_price", "avg_entry_price", "average_entry_price"):
+                if k in pos and pos[k] is not None:
+                    try:
+                        entry_price = float(pos[k])
+                        break
+                    except Exception:
+                        pass
+
+        has_position = abs(pos_size) > 0
+
+        # If we previously thought we were in position but now flat => trade closed
+        if self.in_position and not has_position:
+            print("[SYNC] Position closed on exchange. Cleaning up orders and resetting state.")
+            self._cleanup_orders_safe()
+            self._reset_position_state()
+            return
+
+        # If we were flat but now have a position => entry filled
+        if (not self.in_position) and has_position:
+            print("[SYNC] Detected an open position on exchange (entry likely filled).")
+            # Determine side
+            side = "long" if pos_size > 0 else "short"
+            self.in_position = True
+            self.side = side
+            self.size_contracts = int(abs(pos_size))  # assumes contracts are integer
+
+            # Use exchange-reported entry if available, else fallback to pending entry price
+            if entry_price and entry_price > 0:
+                self.entry_price = entry_price
+            elif self.pending:
+                self.entry_price = self.pending.entry_price
+
+            # If pending exists, copy its strict stop/target
+            if self.pending:
+                self.strict_stop = self.pending.strict_stop
+                self.target = self.pending.target
+                self.current_stop = self.strict_stop
+                self.hh_since = self.entry_price
+                self.ll_since = self.entry_price
+                self.ema_against_count = 0
+
+                # Place protective orders now
+                self._place_initial_exits()
+                self.pending = None
+
+        # Cancel expired pending entries (handled on candle-close too, but keep safe)
+        if self.pending:
+            now_local = pd.Timestamp.now(tz=LOCAL_TZ)
+            if now_local >= self.pending.expiry_candle_time:
+                print("[SYNC] Pending entry expired. Cancelling entry order if still open.")
+                self._cancel_pending_entry()
+
+    # ---------- orders ----------
+    def _place_order(self, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if DRY_RUN:
+            print(f"[DRY_RUN] Would place order: {json.dumps(order, indent=2)}")
+            return None
+
+        last_err = None
+        for _ in range(MAX_ORDER_RETRIES):
+            try:
+                resp = self.client.place_order(order)
+                return resp
+            except Exception as e:
+                last_err = e
+                time.sleep(1)
+        raise RuntimeError(f"Order failed after retries: {last_err}")
+
+    def _cancel_order(self, order_id: int) -> None:
+        if DRY_RUN:
+            print(f"[DRY_RUN] Would cancel order id={order_id}")
+            return
+        try:
+            self.client.cancel_order(order_id)
+        except Exception as e:
+            print(f"[WARN] cancel_order failed for {order_id}: {e}")
+
+    def _edit_order(self, order_id: int, fields: Dict[str, Any]) -> bool:
+        if DRY_RUN:
+            print(f"[DRY_RUN] Would edit order id={order_id} fields={fields}")
+            return True
+        try:
+            self.client.edit_order(order_id, self.product.product_id, fields)
+            return True
+        except Exception as e:
+            print(f"[WARN] edit_order failed for {order_id}: {e}")
+            return False
+
+    def _cleanup_orders_safe(self) -> None:
+        # Best effort: cancel known TP/SL orders; also try cancel-all for product
+        if self.tp_order_id:
+            self._cancel_order(self.tp_order_id)
+            self.tp_order_id = None
+        if self.stop_order_id:
+            self._cancel_order(self.stop_order_id)
+            self.stop_order_id = None
+
+        if DRY_RUN:
+            return
+
+        try:
+            self.client.cancel_all_orders(self.product.product_id)
+        except Exception as e:
+            print(f"[WARN] cancel_all_orders failed: {e}")
+
+    def _reset_position_state(self) -> None:
+        self.in_position = False
+        self.side = None
+        self.size_contracts = 0
+        self.entry_price = 0.0
+        self.strict_stop = 0.0
+        self.current_stop = 0.0
+        self.target = 0.0
+        self.hh_since = 0.0
+        self.ll_since = 0.0
+        self.ema_against_count = 0
+
+    def _cancel_pending_entry(self) -> None:
+        if self.pending and self.pending.entry_order_id:
+            self._cancel_order(self.pending.entry_order_id)
+        self.pending = None
+
+    # ---------- entry & exits ----------
+    def place_pending_entry_from_signal(self, signal_row: pd.Series, signal_time: pd.Timestamp, side: str) -> None:
+        """
+        Creates a pending stop-entry order valid for the next candle only (matches your backtest).
+        """
+        tick = self.product.tick_size
+
+        if side == "long":
+            entry = ceil_to_tick(float(signal_row["high"]), tick)
+            strict_sl = floor_to_tick(float(signal_row["low"]), tick)
+            rpu = entry - strict_sl
+            if rpu <= 0:
+                print("[SKIP] Invalid long RPU (entry <= stop).")
+                return
+            target = ceil_to_tick(entry + TP_R_MULTIPLE * rpu, tick)
+
+            size_contracts = self._compute_entry_size_contracts(entry, rpu)
+            if size_contracts <= 0:
+                print("[SKIP] Long size_contracts <= 0 (margin/risk too small).")
+                return
+
+            # Stop-entry order (market) at entry price
+            # NOTE: stop orders are conditional; you may need to adapt stop_order_type depending on your account.
+            order = {
+                "product_id": self.product.product_id,
+                "size": int(size_contracts),
+                "side": "buy",
+                "order_type": "market_order",
+                "stop_price": fmt_price(entry),
+                "stop_order_type": "stop_loss_order",
+                "stop_trigger_method": STOP_TRIGGER_METHOD,
+                "reduce_only": False,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+        else:  # short
+            entry = floor_to_tick(float(signal_row["low"]), tick)
+            strict_sl = ceil_to_tick(float(signal_row["high"]), tick)
+            rpu = strict_sl - entry
+            if rpu <= 0:
+                print("[SKIP] Invalid short RPU (stop <= entry).")
+                return
+            target = floor_to_tick(entry - TP_R_MULTIPLE * rpu, tick)
+
+            size_contracts = self._compute_entry_size_contracts(entry, rpu)
+            if size_contracts <= 0:
+                print("[SKIP] Short size_contracts <= 0 (margin/risk too small).")
+                return
+
+            order = {
+                "product_id": self.product.product_id,
+                "size": int(size_contracts),
+                "side": "sell",
+                "order_type": "market_order",
+                "stop_price": fmt_price(entry),
+                "stop_order_type": "stop_loss_order",
+                "stop_trigger_method": STOP_TRIGGER_METHOD,
+                "reduce_only": False,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+        expiry = signal_time + pd.Timedelta(seconds=self.tf_seconds)
+
+        print(f"[PENDING] {side.upper()} signal @ {signal_time} | entry={entry} strictSL={strict_sl} target={target} "
+              f"contracts={size_contracts} expires={expiry}")
+
+        resp = self._place_order(order)
+        entry_order_id = None
+        if resp and isinstance(resp, dict):
+            entry_order_id = resp.get("id")
+
+        self.pending = PendingEntry(
+            side=side,
+            signal_candle_time=signal_time,
+            expiry_candle_time=expiry,
+            entry_price=entry,
+            strict_stop=strict_sl,
+            risk_per_unit=rpu,
+            target=target,
+            size_contracts=int(size_contracts),
+            entry_order_id=entry_order_id,
+        )
+
+    def _place_initial_exits(self) -> None:
+        """
+        After entry fills: place TP limit + SL stop-market.
+        SL is the STRICT stop initially; chandelier updates later on candle close.
+        """
+        if not self.in_position or self.side is None or self.size_contracts <= 0:
+            return
+
+        tick = self.product.tick_size
+
+        # Use strict stop initially
+        sl_price = self.strict_stop
+        tp_price = self.target
+
+        if self.side == "long":
+            sl_order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "sell",
+                "order_type": "market_order",
+                "stop_price": fmt_price(floor_to_tick(sl_price, tick)),
+                "stop_order_type": "stop_loss_order",
+                "stop_trigger_method": STOP_TRIGGER_METHOD,
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+            tp_order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "sell",
+                "order_type": "limit_order",
+                "limit_price": fmt_price(ceil_to_tick(tp_price, tick)),
+                "time_in_force": "gtc",
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+        else:
+            sl_order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "buy",
+                "order_type": "market_order",
+                "stop_price": fmt_price(ceil_to_tick(sl_price, tick)),
+                "stop_order_type": "stop_loss_order",
+                "stop_trigger_method": STOP_TRIGGER_METHOD,
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+            tp_order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "buy",
+                "order_type": "limit_order",
+                "limit_price": fmt_price(floor_to_tick(tp_price, tick)),
+                "time_in_force": "gtc",
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+        print(f"[EXITS] Placing SL={sl_price} (strict) and TP={tp_price} for {self.side} size={self.size_contracts}")
+        sl_resp = self._place_order(sl_order)
+        tp_resp = self._place_order(tp_order)
+
+        if sl_resp and isinstance(sl_resp, dict):
+            self.stop_order_id = sl_resp.get("id")
+        if tp_resp and isinstance(tp_resp, dict):
+            self.tp_order_id = tp_resp.get("id")
+
+    # ---------- candle-close handler ----------
+    def on_candle_close(self, df: pd.DataFrame) -> None:
+        """
+        Called ONLY when a candle has closed (and df[-1] is that closed candle).
+        Performs:
+        - exit mgmt updates (EMA-against, chandelier update) if in trade
+        - entry signal generation if flat and no pending entry
+        - expiry management for pending entries
+        """
+        last = df.iloc[-1]
+        t = df.index[-1]  # candle start time in LOCAL_TZ
+
+        # 1) If pending entry expired (valid only next candle)
+        if self.pending and t >= self.pending.expiry_candle_time:
+            print("[PENDING] Expired at candle close, cancelling pending entry.")
+            self._cancel_pending_entry()
+
+        # 2) If we are in a trade, update early exit + trailing stop (CANDLE-CLOSE ONLY)
+        if self.in_position and self.side:
+            ema9 = float(last["ema_short"]) if not pd.isna(last["ema_short"]) else float("nan")
+            close = float(last["close"])
+            atr = float(last["atr_14"]) if not pd.isna(last["atr_14"]) else float("nan")
+            high = float(last["high"])
+            low = float(last["low"])
+
+            # Early exit: 3 consecutive closes against EMA9
+            if self.side == "long":
+                if close < ema9:
+                    self.ema_against_count += 1
+                else:
+                    self.ema_against_count = 0
+            else:
+                if close > ema9:
+                    self.ema_against_count += 1
+                else:
+                    self.ema_against_count = 0
+
+            if self.ema_against_count >= LOSS_EMA_N:
+                print(f"[EARLY EXIT] {LOSS_EMA_N} closes against EMA9. Exiting at market on candle close.")
+                self.exit_market(reason=f"ema_against_{LOSS_EMA_N}")
+                return
+
+            # Chandelier update (ONLY after candle closes)
+            if atr == atr and atr > 0:
+                tick = self.product.tick_size
+
+                if self.side == "long":
+                    self.hh_since = max(self.hh_since, high)
+                    chand = self.hh_since - TRAIL_ATR_MULT * atr
+                    # Active stop = max(strict stop, current stop, chandelier)
+                    new_stop = max(self.strict_stop, self.current_stop, chand)
+                    new_stop = floor_to_tick(new_stop, tick)
+
+                    if new_stop > self.current_stop:
+                        print(f"[TRAIL] Long: HH={self.hh_since:.2f}, ATR={atr:.2f}, chand={chand:.2f} => SL {self.current_stop:.2f} -> {new_stop:.2f}")
+                        self.current_stop = new_stop
+                        self.update_stop_order()
+
+                else:
+                    self.ll_since = min(self.ll_since, low)
+                    chand = self.ll_since + TRAIL_ATR_MULT * atr
+                    # Active stop = min(strict stop, current stop, chandelier)
+                    new_stop = min(self.strict_stop, self.current_stop, chand)
+                    new_stop = ceil_to_tick(new_stop, tick)
+
+                    if new_stop < self.current_stop:
+                        print(f"[TRAIL] Short: LL={self.ll_since:.2f}, ATR={atr:.2f}, chand={chand:.2f} => SL {self.current_stop:.2f} -> {new_stop:.2f}")
+                        self.current_stop = new_stop
+                        self.update_stop_order()
+
+            return  # while in trade, do not open new one
+
+        # 3) If flat and no pending entry, evaluate signals on THIS closed candle
+        if (not self.in_position) and (self.pending is None):
+            minute_of_day = int(last["minute_of_day"])
+            # Calendar filter: skip 01:00-07:00 IST
+            if SKIP_START_MINUTE <= minute_of_day < SKIP_END_MINUTE:
+                print(f"[FILTER] Time filter active ({minute_of_day} min). Skipping signals.")
+                return
+
+            rsi_slope = float(last["rsi_slope"]) if not pd.isna(last["rsi_slope"]) else 0.0
+
+            long_sig = bool(last["long_signal_raw"]) and (rsi_slope > 0)
+            short_sig = bool(last["short_signal_raw"]) and (rsi_slope < 0)
+
+            if long_sig:
+                self.place_pending_entry_from_signal(last, t, side="long")
+            elif short_sig:
+                self.place_pending_entry_from_signal(last, t, side="short")
+
+    def update_stop_order(self) -> None:
+        """
+        Updates the exchange stop-loss order to current_stop.
+        Candle-close trailing: called only from on_candle_close().
+        """
+        if not self.in_position or not self.side or self.stop_order_id is None:
+            return
+
+        fields = {"stop_price": fmt_price(self.current_stop)}
+
+        ok = self._edit_order(self.stop_order_id, fields)
+        if not ok:
+            # Fallback: cancel + replace
+            print("[TRAIL] edit failed; cancel+replace stop order.")
+            old = self.stop_order_id
+            self._cancel_order(old)
+            self.stop_order_id = None
+            # Re-place stop order at current_stop
+            self._place_initial_stop_only()
+
+    def _place_initial_stop_only(self) -> None:
+        if not self.in_position or not self.side or self.size_contracts <= 0:
+            return
+        tick = self.product.tick_size
+        sl_price = self.current_stop
+
+        if self.side == "long":
+            sl_order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "sell",
+                "order_type": "market_order",
+                "stop_price": fmt_price(floor_to_tick(sl_price, tick)),
+                "stop_order_type": "stop_loss_order",
+                "stop_trigger_method": STOP_TRIGGER_METHOD,
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+        else:
+            sl_order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "buy",
+                "order_type": "market_order",
+                "stop_price": fmt_price(ceil_to_tick(sl_price, tick)),
+                "stop_order_type": "stop_loss_order",
+                "stop_trigger_method": STOP_TRIGGER_METHOD,
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+        resp = self._place_order(sl_order)
+        if resp and isinstance(resp, dict):
+            self.stop_order_id = resp.get("id")
+
+    def exit_market(self, reason: str = "manual_exit") -> None:
+        """
+        Market-exit the position (reduce-only) and cleanup orders.
+        """
+        if not self.in_position or not self.side or self.size_contracts <= 0:
+            return
+
+        if self.side == "long":
+            order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "sell",
+                "order_type": "market_order",
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+        else:
+            order = {
+                "product_id": self.product.product_id,
+                "size": int(self.size_contracts),
+                "side": "buy",
+                "order_type": "market_order",
+                "reduce_only": True,
+                "client_order_id": str(uuid.uuid4()),
+            }
+
+        print(f"[EXIT] Market exit ({reason}).")
+        self._place_order(order)
+
+        # Cleanup local state + try to cancel leftover orders
+        self._cleanup_orders_safe()
+        self._reset_position_state()
+
+
+# =========================
+# CANDLE FETCH
+# =========================
+
+def fetch_last_closed_candles(client: DeltaClient, symbol: str, resolution: str, tf_seconds: int) -> pd.DataFrame:
+    end_epoch = last_closed_candle_end_epoch(tf_seconds)
+    start_epoch = end_epoch - tf_seconds * LOOKBACK_BARS
+
+    candles = client.get_candles(symbol, resolution, start_epoch, end_epoch)
+    if not candles:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(candles)
+    if "time" not in df.columns:
+        return pd.DataFrame()
+
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(LOCAL_TZ)
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = df[col].astype(float)
+
+    df = df.sort_values("time").set_index("time")[["open", "high", "low", "close", "volume"]]
+    return df
+
+
+# =========================
+# MAIN LOOP
+# =========================
+
+def main() -> None:
+    tf_seconds = resolution_to_seconds(RESOLUTION)
+    print("===============================================")
+    print("Delta LIVE EMA Pullback Bot")
+    print("===============================================")
+    print(f"SYMBOL={SYMBOL}  TF={RESOLUTION}")
+    print(f"CAPITAL_DEPLOYED_USD={CAPITAL_DEPLOYED_USD}  LEVERAGE={LEVERAGE}  MAX_NOTIONAL={CAPITAL_DEPLOYED_USD*LEVERAGE}")
+    print(f"RISK_PER_TRADE={RISK_PER_TRADE}  FULL_LEVERAGE_MODE={FULL_LEVERAGE_MODE}")
+    print(f"DRY_RUN={DRY_RUN}")
+    print("===============================================")
+
+    client = DeltaClient(DELTA_BASE_URL, API_KEY, API_SECRET)
+
+    # Product discovery (contract_value, tick_size)
+    p = client.get_product_by_symbol(SYMBOL)
+    product_id = int(p["id"])
+    contract_value = float(p.get("contract_value", 0.001))  # BTC per contract
+    tick_size = float(p.get("tick_size", 0.5))
+
+    product = ProductInfo(product_id=product_id, symbol=SYMBOL, contract_value_btc=contract_value, tick_size=tick_size)
+    print(f"[PRODUCT] id={product_id} contract_value_btc={contract_value} tick_size={tick_size}")
+
+    # Set leverage for this product (required on some accounts)
+    if not DRY_RUN:
+        try:
+            client.set_orders_leverage(product_id, LEVERAGE)
+            print(f"[LEVERAGE] Set orders leverage to {LEVERAGE} for product_id={product_id}")
+        except Exception as e:
+            print(f"[WARN] Failed to set leverage via API: {e}")
+
+    bot = LiveBot(client, product, tf_seconds)
+
+    last_seen_candle_time: Optional[pd.Timestamp] = None
+
+    while True:
+        try:
+            # Sync fills / exits
+            bot.sync_with_exchange()
+
+            # Fetch last closed candles
+            df = fetch_last_closed_candles(client, SYMBOL, RESOLUTION, tf_seconds)
+            if df.empty or len(df) < 50:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Indicators + signals
+            df = add_indicators(df)
+            df = build_base_signals(df)
+
+            candle_time = df.index[-1]
+            if last_seen_candle_time is None or candle_time > last_seen_candle_time:
+                last_seen_candle_time = candle_time
+                print(f"\n[CLOSE] New candle closed: {candle_time} | close={df.iloc[-1]['close']:.2f}")
+                bot.on_candle_close(df)
+
+            time.sleep(POLL_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\n[STOP] KeyboardInterrupt received. Exiting safely.")
+            # best-effort cleanup
+            try:
+                bot._cleanup_orders_safe()
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

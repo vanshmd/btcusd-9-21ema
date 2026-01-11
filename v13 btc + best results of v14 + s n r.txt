@@ -1,0 +1,1729 @@
+"""
+EMA Pullback Strategy + Support/Resistance Filter Optimizer (1000+ SR Variants)
+=============================================================================
+
+What this script does
+---------------------
+1) Builds your EMA pullback base signals (NO lookahead)
+2) (Optional) Applies your "best-known" filter:
+     - cal:skip_0100_0700:both
+     - RSI slope: long requires rsi_slope > 0, short requires rsi_slope < 0
+3) Tests 1000+ *support/resistance* filter variants (no indicator stacking):
+     - Pivot points (classic/fib/camarilla/woodie/demark) on Daily + Weekly
+     - Swing High/Low (rolling) for many lookbacks
+     - Fibonacci retracement levels for many lookbacks + 2 fib sets
+     - (Optional) K-means price-level clustering (disabled by default; slow)
+4) For each SR configuration, it filters trades using your rule:
+
+   - SHORT trades:
+       If entry price is *near support* AND price has NOT broken below support -> SKIP
+   - LONG trades:
+       If entry price is *near resistance* AND price has NOT broken above resistance -> SKIP
+
+   "Near" is measured as a multiple of ATR(14) of the signal candle.
+
+Core guarantees (same as your earlier code)
+-------------------------------------------
+- Signals use current candle only (no future candles).
+- Entry executes on NEXT candle via stop-entry at signal candle high/low.
+- Stops/targets based on signal candle.
+- If stop & target hit in same bar, stop assumed first (conservative).
+- Fees + slippage applied against you.
+
+Outputs
+-------
+- btc_sr_filter_search_summary.csv : all tested SR configs + full/train/oos metrics
+- btc_top20_sr_filters.csv        : top 20 SR configs ranked by robust_cagr_pct
+- btc_best_sr_filter_trades.csv   : detailed trades for the best SR config
+
+Install
+-------
+pip install numpy pandas requests numba pyarrow
+
+Run
+---
+python btc_ema_sr_filter_optimizer_1000.py
+
+DISCLAIMER
+----------
+Research/backtesting only. Not financial advice.
+"""
+
+from __future__ import annotations
+
+import os
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+
+try:
+    from numba import njit  # type: ignore
+except Exception:  # pragma: no cover
+    njit = None
+
+
+# ==============================
+# CONFIG - EDIT THESE PARAMETERS
+# ==============================
+
+# Backtest date range in *local* timezone (IST = UTC+5:30)
+START_DATE = "2020-01-01"
+END_DATE   = "2025-12-31"
+
+# Train / OOS split (OOS starts the next day after TRAIN_END_DATE)
+TRAIN_END_DATE = "2024-12-31"
+
+# Trading instrument (Delta Exchange spot/indices use different symbols; you used BTCUSD)
+SYMBOL = "BTCUSD"
+
+# Timeframes to test (Delta resolution strings)
+TIMEFRAMES = ["5m"]
+
+# Local timezone (India)
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
+
+# Capital & risk
+INITIAL_CAPITAL         = 30000.0
+RISK_PER_TRADE          = 0.01
+TAKE_PROFIT_R_MULTIPLE  = 3.0
+
+# EMA settings
+EMA_SHORT        = 9
+EMA_LONG         = 15
+EMA_TREND_FILTER = 200
+EMA_9_200_MIN_DIST = 0.003  # base strategy requires EMA9 vs EMA200 distance >= 0.3%
+
+# Trend / slope / angle settings
+EMA_SLOPE_LOOKBACK      = 3
+MIN_SLOPE_PCT           = 0.0001
+EMA_LONG_MIN_ANGLE_DEG  = 33.0
+EMA_LONG_ANGLE_SCALE    = 500.0
+MIN_EMA_SEPARATION_PCT  = 0.0003
+CROSS_LOOKBACK          = 10
+
+# Candle pattern parameters
+PINBAR_WICK_RATIO = 1.2
+PINBAR_MAX_WICK_BODY_RATIO = 1.2
+STRONG_BODY_MIN_BODY_TO_RANGE = 0.4
+
+# Trading costs
+BROKERAGE_TOTAL_RATE    = 0.0006
+SLIPPAGE_TOTAL_RATE     = 0.0002
+BROKERAGE_HALF_RATE     = BROKERAGE_TOTAL_RATE / 2.0
+SLIPPAGE_HALF_RATE      = SLIPPAGE_TOTAL_RATE / 2.0
+
+# --- IMPORTANT ---
+# Optional "fixed best-known filter" you provided earlier:
+#   cal:skip_0100_0700:both|side:both|ind:rsi|rsi:slope_pos_long_slope_neg_short
+APPLY_FIXED_BEST_FILTER = True
+
+# Trade-count constraints (avoid tiny-sample "best" configs)
+MIN_TRADES_FULL_FOR_RANK   = 30
+MIN_TRADES_TRAIN_FOR_RANK  = 150
+MIN_TRADES_OOS_FOR_RANK    = 40
+
+# Require profitability in BOTH segments for ranking
+REQUIRE_POSITIVE_TRAIN_AND_OOS = True
+
+# Support/Resistance "near" thresholds (in ATR multiples)
+# More thresholds = more SR variants.
+NEAR_ATR_MULTIPLES = [0.10, 0.20, 0.30, 0.50, 0.80]
+
+# --- SR Variant Counts ---
+# We will generate >= 1000 SR configs using:
+#   Pivot (daily+weekly) + SwingHighLow + Fibonacci
+# You can tune these to change total configs / runtime.
+
+# Swing lookback generation (in bars)
+SWING_MIN_LB = 24      # 2 hours on 5m
+SWING_MAX_LB = 2880    # 10 days on 5m
+SWING_N_LBS  = 140     # number of unique lookbacks (log-spaced)
+
+# Fibonacci lookbacks: by default reuse the swing lookbacks (fast, and still huge variety)
+FIB_REUSE_SWING_LOOKBACKS = True
+FIB_N_LBS = 100  # used only if reuse=False
+
+# Pivot variants
+PIVOT_PERIODS = ["D", "W"]  # daily, weekly (local timezone)
+PIVOT_METHODS = ["classic", "fibonacci", "camarilla", "woodie", "demark"]
+
+# Optional: K-means clustering support/resistance (slow; disabled by default)
+ENABLE_KMEANS_SR = True
+KMEANS_WINDOWS = [1000, 2000]     # bars
+KMEANS_KS      = [5, 7]           # clusters
+KMEANS_UPDATE_EVERY_BARS = 288    # recompute about once/day on 5m
+KMEANS_MAX_UPDATES = 2500         # safety cap
+
+# Candles API chunk size
+MAX_CANDLES_PER_REQUEST = 4000
+
+# Output paths
+RESULTS_SUMMARY_CSV_PATH = "btc_sr_filter_search_summary.csv"
+TOP_N_TO_SAVE            = 20
+TOP_FILTERS_CSV_PATH     = "btc_top20_sr_filters.csv"
+BEST_TRADES_CSV_PATH     = "btc_best_sr_filter_trades.csv"
+
+# Optional: cache candles to avoid re-downloading
+USE_CACHE = True
+CACHE_DIR = "candle_cache"
+
+
+# ==============================
+# DELTA API (public endpoints)
+# ==============================
+
+DELTA_BASE_URL = "https://api.delta.exchange"
+USER_AGENT = "python-ema-sr-optimizer"
+
+
+def delta_request(method: str, path: str, params: Optional[Dict] = None) -> Dict:
+    url = f"{DELTA_BASE_URL}{path}"
+    params = params or {}
+    headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
+
+    resp = requests.request(method=method, url=url, params=params, timeout=(5, 60), headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(f"Delta API error: {data.get('error')}")
+    return data.get("result", data)
+
+
+def resolution_to_seconds(resolution: str) -> int:
+    res = resolution.strip().lower()
+    unit = res[-1]
+    value = int(res[:-1])
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 60 * 60
+    if unit == "d":
+        return value * 24 * 60 * 60
+    if unit == "w":
+        return value * 7 * 24 * 60 * 60
+    raise ValueError(f"Unsupported resolution: {resolution}")
+
+
+def local_date_range_to_utc_epochs(start_date: str, end_date: str, local_tz: timezone) -> Tuple[int, int]:
+    local_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=local_tz)
+    local_end = (
+        datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=local_tz)
+        + timedelta(days=1) - timedelta(seconds=1)
+    )
+    start_utc = local_start.astimezone(timezone.utc)
+    end_utc = local_end.astimezone(timezone.utc)
+    return int(start_utc.timestamp()), int(end_utc.timestamp())
+
+
+def _cache_path(symbol: str, resolution: str, start_date: str, end_date: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fname = f"{symbol}_{resolution}_{start_date}_{end_date}.parquet"
+    return os.path.join(CACHE_DIR, fname)
+
+
+def fetch_ohlc_from_delta(symbol: str, resolution: str, start_date: str, end_date: str) -> pd.DataFrame:
+    if USE_CACHE:
+        path = _cache_path(symbol, resolution, start_date, end_date)
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize(LOCAL_TZ)
+            return df
+
+    start_ts, end_ts = local_date_range_to_utc_epochs(start_date, end_date, LOCAL_TZ)
+    res_seconds = resolution_to_seconds(resolution)
+    max_span = res_seconds * MAX_CANDLES_PER_REQUEST
+
+    all_records: List[Dict] = []
+    print(f"Fetching {symbol} {resolution} candles from {start_date} to {end_date} (LOCAL {LOCAL_TZ})")
+
+    current_start = start_ts
+    path = "/v2/history/candles"
+    while current_start < end_ts:
+        current_end = min(current_start + max_span - 1, end_ts)
+        params = {"symbol": symbol, "resolution": resolution, "start": current_start, "end": current_end}
+        result = delta_request("GET", path, params=params)
+        if not result:
+            break
+        all_records.extend(result)
+        current_start = current_end + 1
+
+    if not all_records:
+        raise RuntimeError("No candle data returned from Delta Exchange for given range.")
+
+    df = pd.DataFrame(all_records)
+    if "time" not in df.columns:
+        raise RuntimeError(f"Unexpected candle format. Columns: {df.columns.tolist()}")
+
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(LOCAL_TZ)
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            raise RuntimeError(f"Expected column '{col}' not found in candles data.")
+        df[col] = df[col].astype(float)
+
+    df = df.sort_values("time").set_index("time")[["open", "high", "low", "close", "volume"]].copy()
+
+    if USE_CACHE:
+        df.to_parquet(_cache_path(symbol, resolution, start_date, end_date))
+
+    print(f"Fetched {len(df)} candles. Range: {df.index[0]} -> {df.index[-1]} (LOCAL)")
+    return df
+
+
+# ==============================
+# INDICATORS (no lookahead)
+# ==============================
+
+def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / window, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / window, adjust=False).mean()
+
+
+def add_indicators(df: pd.DataFrame, resolution: str) -> pd.DataFrame:
+    df = df.copy()
+    close = df["close"]
+
+    # EMAs
+    df["ema_short"] = close.ewm(span=EMA_SHORT, adjust=False).mean()
+    df["ema_long"]  = close.ewm(span=EMA_LONG,  adjust=False).mean()
+    df["ema_200"]   = close.ewm(span=EMA_TREND_FILTER, adjust=False).mean()
+
+    # EMA slopes/angles (for base trend rules)
+    ema_long_prev  = df["ema_long"].shift(EMA_SLOPE_LOOKBACK)
+    slope_long_pct = (df["ema_long"] - ema_long_prev) / ema_long_prev
+    df["slope_long_pct"]  = slope_long_pct
+    df["ema_long_angle_deg"]  = np.degrees(np.arctan(slope_long_pct  * EMA_LONG_ANGLE_SCALE))
+
+    df["ema_sep_pct"] = (df["ema_short"] - df["ema_long"]).abs() / df["close"].replace(0.0, np.nan)
+
+    # recent EMA cross filter
+    df["ema_diff_sign"] = np.sign(df["ema_short"] - df["ema_long"])
+    df["ema_cross"] = df["ema_diff_sign"].ne(df["ema_diff_sign"].shift(1))
+    df["recent_cross"] = df["ema_cross"].rolling(CROSS_LOOKBACK).max().fillna(0).astype(bool)
+
+    df["long_trend"] = (
+        (df["ema_short"] > df["ema_long"]) &
+        (df["slope_long_pct"] > MIN_SLOPE_PCT) &
+        (df["ema_long_angle_deg"] >= EMA_LONG_MIN_ANGLE_DEG) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    df["short_trend"] = (
+        (df["ema_short"] < df["ema_long"]) &
+        (df["slope_long_pct"] < -MIN_SLOPE_PCT) &
+        (df["ema_long_angle_deg"] <= -EMA_LONG_MIN_ANGLE_DEG) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    # RSI + slope (for your fixed filter)
+    df["rsi_14"] = compute_rsi(close, 14)
+    df["rsi_slope"] = df["rsi_14"] - df["rsi_14"].shift(1)
+
+    # ATR (needed for SR "near" thresholds)
+    df["atr_14"] = compute_atr(df["high"], df["low"], close, 14)
+
+    # EMA9-EMA200 distance (base regime rule)
+    df["dist_9_200"] = (df["ema_short"] - df["ema_200"]).abs() / close.replace(0.0, np.nan)
+
+    # Timestamp features (LOCAL timezone already)
+    idx = df.index
+    df["minute_of_day"] = idx.hour * 60 + idx.minute
+    df["day_of_week"] = idx.dayofweek  # 0=Mon ... 6=Sun
+
+    return df
+
+
+# ==============================
+# BASE STRATEGY SIGNALS (vectorized, no lookahead)
+# ==============================
+
+def build_base_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    o = df["open"]
+    h = df["high"]
+    l = df["low"]
+    c = df["close"]
+
+    body = (c - o).abs()
+    rng = (h - l)
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
+
+    is_bull = c > o
+    is_bear = c < o
+
+    bullish_pinbar = (
+        is_bull &
+        (body > 0) &
+        (lower_wick >= PINBAR_WICK_RATIO * body) &
+        (upper_wick <= PINBAR_MAX_WICK_BODY_RATIO * body)
+    )
+    bearish_pinbar = (
+        is_bear &
+        (body > 0) &
+        (upper_wick >= PINBAR_WICK_RATIO * body) &
+        (lower_wick <= PINBAR_MAX_WICK_BODY_RATIO * body)
+    )
+
+    strong_bull = is_bull & (rng > 0) & ((body / rng) >= STRONG_BODY_MIN_BODY_TO_RANGE)
+    strong_bear = is_bear & (rng > 0) & ((body / rng) >= STRONG_BODY_MIN_BODY_TO_RANGE)
+
+    ema_s = df["ema_short"]
+    ema_l = df["ema_long"]
+    ema200 = df["ema_200"]
+
+    touches = ((l <= ema_s) & (ema_s <= h)) | ((l <= ema_l) & (ema_l <= h))
+    dist_9_200 = df["dist_9_200"]
+
+    ok_ind = ~(ema_s.isna() | ema_l.isna() | ema200.isna() | c.isna())
+
+    long_signal_raw = (
+        ok_ind &
+        df["long_trend"] &
+        touches &
+        (ema_s > ema200) &
+        (dist_9_200 >= EMA_9_200_MIN_DIST) &
+        (c > ema_s) & (c > ema_l) &
+        (bullish_pinbar | strong_bull | is_bull)
+    )
+
+    short_signal_raw = (
+        ok_ind &
+        df["short_trend"] &
+        touches &
+        (ema200 > ema_s) &
+        (dist_9_200 >= EMA_9_200_MIN_DIST) &
+        (c < ema_s) & (c < ema_l) &
+        (bearish_pinbar | strong_bear | is_bear)
+    )
+
+    df["long_signal_raw"] = long_signal_raw.fillna(False)
+    df["short_signal_raw"] = short_signal_raw.fillna(False)
+
+    print(f"Base signals: long={int(df['long_signal_raw'].sum())}, short={int(df['short_signal_raw'].sum())}")
+    return df
+
+
+# ==============================
+# FAST BACKTEST (Numba)
+# ==============================
+
+if njit is not None:
+
+    @njit
+    def _simulate_one(
+        open_: np.ndarray,
+        high: np.ndarray,
+        low: np.ndarray,
+        close: np.ndarray,
+        long_signal: np.ndarray,
+        short_signal: np.ndarray,
+        initial_capital: float,
+        risk_per_trade: float,
+        tp_r_multiple: float,
+        brokerage_half_rate: float,
+        slippage_half_rate: float,
+    ) -> Tuple[float, float, float, float, float, float, float, float, float]:
+        """
+        Returns:
+          total_trades, win_rate, simple_return_pct, compounded_return_pct, max_drawdown_pct,
+          sharpe, profit_factor, avg_return_pct, final_equity
+        """
+        n = close.shape[0]
+        equity = initial_capital
+        peak_equity = equity
+        max_dd = 0.0  # negative
+
+        total_trades = 0.0
+        wins = 0.0
+        losses = 0.0
+        sum_ret = 0.0
+        compounded = 1.0
+
+        sum_pos_ret = 0.0
+        sum_neg_ret = 0.0
+
+        # sharpe via Welford
+        count = 0.0
+        mean = 0.0
+        m2 = 0.0
+
+        in_trade = False
+        side = 0  # 1 long, -1 short
+
+        entry_price = 0.0
+        stop_loss = 0.0
+        target = 0.0
+        size = 0.0
+        entry_equity = 0.0
+
+        for i in range(1, n):
+            bar_high = high[i]
+            bar_low = low[i]
+
+            if in_trade:
+                exit_price = 0.0
+                hit = 0  # 0 none, 1 stop, 2 target, 3 both=>stop first
+
+                if side == 1:
+                    stop_hit = bar_low <= stop_loss
+                    target_hit = bar_high >= target
+                    if stop_hit and target_hit:
+                        exit_price = stop_loss
+                        hit = 3
+                    elif stop_hit:
+                        exit_price = stop_loss
+                        hit = 1
+                    elif target_hit:
+                        exit_price = target
+                        hit = 2
+                else:
+                    stop_hit = bar_high >= stop_loss
+                    target_hit = bar_low <= target
+                    if stop_hit and target_hit:
+                        exit_price = stop_loss
+                        hit = 3
+                    elif stop_hit:
+                        exit_price = stop_loss
+                        hit = 1
+                    elif target_hit:
+                        exit_price = target
+                        hit = 2
+
+                if hit != 0:
+                    if side == 1:
+                        entry_eff = entry_price * (1.0 + slippage_half_rate)
+                        exit_eff = exit_price * (1.0 - slippage_half_rate)
+                        gross_pnl = (exit_eff - entry_eff) * size
+                    else:
+                        entry_eff = entry_price * (1.0 - slippage_half_rate)
+                        exit_eff = exit_price * (1.0 + slippage_half_rate)
+                        gross_pnl = (entry_eff - exit_eff) * size
+
+                    cost_entry = abs(entry_eff * size) * brokerage_half_rate
+                    cost_exit = abs(exit_eff * size) * brokerage_half_rate
+                    net_pnl = gross_pnl - (cost_entry + cost_exit)
+
+                    trade_ret = 0.0
+                    if entry_equity != 0.0:
+                        trade_ret = net_pnl / entry_equity
+
+                    equity = equity * (1.0 + trade_ret)
+
+                    total_trades += 1.0
+                    if net_pnl > 0.0:
+                        wins += 1.0
+                    elif net_pnl < 0.0:
+                        losses += 1.0
+
+                    sum_ret += trade_ret
+                    compounded = compounded * (1.0 + trade_ret)
+                    if trade_ret > 0.0:
+                        sum_pos_ret += trade_ret
+                    elif trade_ret < 0.0:
+                        sum_neg_ret += trade_ret
+
+                    # Welford update
+                    count += 1.0
+                    delta = trade_ret - mean
+                    mean = mean + delta / count
+                    delta2 = trade_ret - mean
+                    m2 = m2 + delta * delta2
+
+                    if equity > peak_equity:
+                        peak_equity = equity
+                    dd = (equity - peak_equity) / peak_equity
+                    if dd < max_dd:
+                        max_dd = dd
+
+                    in_trade = False
+                    continue
+
+            if not in_trade:
+                # LONG entry (prev candle signal)
+                if long_signal[i - 1]:
+                    ep = high[i - 1]
+                    sl = low[i - 1]
+                    risk_per_unit = ep - sl
+                    if risk_per_unit > 0.0 and bar_high >= ep:
+                        entry_price = ep
+                        stop_loss = sl
+                        entry_equity = equity
+                        risk_amount = entry_equity * risk_per_trade
+                        size = risk_amount / risk_per_unit
+                        target = entry_price + tp_r_multiple * risk_per_unit
+                        side = 1
+                        in_trade = True
+                        continue
+
+                # SHORT entry (prev candle signal)
+                if short_signal[i - 1]:
+                    ep = low[i - 1]
+                    sl = high[i - 1]
+                    risk_per_unit = sl - ep
+                    if risk_per_unit > 0.0 and bar_low <= ep:
+                        entry_price = ep
+                        stop_loss = sl
+                        entry_equity = equity
+                        risk_amount = entry_equity * risk_per_trade
+                        size = risk_amount / risk_per_unit
+                        target = entry_price - tp_r_multiple * risk_per_unit
+                        side = -1
+                        in_trade = True
+                        continue
+
+        # EOD close
+        if in_trade:
+            exit_price = close[n - 1]
+            if side == 1:
+                entry_eff = entry_price * (1.0 + slippage_half_rate)
+                exit_eff = exit_price * (1.0 - slippage_half_rate)
+                gross_pnl = (exit_eff - entry_eff) * size
+            else:
+                entry_eff = entry_price * (1.0 - slippage_half_rate)
+                exit_eff = exit_price * (1.0 + slippage_half_rate)
+                gross_pnl = (entry_eff - exit_eff) * size
+
+            cost_entry = abs(entry_eff * size) * brokerage_half_rate
+            cost_exit = abs(exit_eff * size) * brokerage_half_rate
+            net_pnl = gross_pnl - (cost_entry + cost_exit)
+
+            trade_ret = 0.0
+            if entry_equity != 0.0:
+                trade_ret = net_pnl / entry_equity
+
+            equity = equity * (1.0 + trade_ret)
+
+            total_trades += 1.0
+            if net_pnl > 0.0:
+                wins += 1.0
+            elif net_pnl < 0.0:
+                losses += 1.0
+
+            sum_ret += trade_ret
+            compounded = compounded * (1.0 + trade_ret)
+            if trade_ret > 0.0:
+                sum_pos_ret += trade_ret
+            elif trade_ret < 0.0:
+                sum_neg_ret += trade_ret
+
+            count += 1.0
+            delta = trade_ret - mean
+            mean = mean + delta / count
+            delta2 = trade_ret - mean
+            m2 = m2 + delta * delta2
+
+            if equity > peak_equity:
+                peak_equity = equity
+            dd = (equity - peak_equity) / peak_equity
+            if dd < max_dd:
+                max_dd = dd
+
+        # metrics
+        win_rate = 0.0
+        if total_trades > 0.0:
+            win_rate = (wins / total_trades) * 100.0
+
+        simple_return_pct = sum_ret * 100.0
+        compounded_return_pct = (compounded - 1.0) * 100.0
+        max_drawdown_pct = (-max_dd) * 100.0
+
+        sharpe = 0.0
+        if count > 1.0:
+            var = m2 / (count - 1.0)
+            if var > 0.0:
+                std = math.sqrt(var)
+                sharpe = (mean / std) * math.sqrt(252.0)
+
+        profit_factor = 0.0
+        if sum_neg_ret < 0.0:
+            profit_factor = sum_pos_ret / (-sum_neg_ret)
+
+        avg_return_pct = 0.0
+        if total_trades > 0.0:
+            avg_return_pct = (sum_ret / total_trades) * 100.0
+
+        return (
+            total_trades,
+            win_rate,
+            simple_return_pct,
+            compounded_return_pct,
+            max_drawdown_pct,
+            sharpe,
+            profit_factor,
+            avg_return_pct,
+            equity,
+        )
+
+else:
+    def _simulate_one(*args, **kwargs):
+        raise RuntimeError("Numba is required. Install: pip install numba")
+
+
+# ==============================
+# Splits + CAGR helpers
+# ==============================
+
+def compute_train_test_slices(n: int, index: pd.DatetimeIndex) -> Tuple[slice, slice]:
+    train_end_dt = (
+        datetime.strptime(TRAIN_END_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+        + timedelta(days=1) - timedelta(seconds=1)
+    )
+    train_end_pos = int(index.searchsorted(train_end_dt, side="right"))
+    train_slice = slice(0, train_end_pos)
+    test_slice = slice(train_end_pos, n)
+    return train_slice, test_slice
+
+
+def _segment_years() -> Tuple[float, float]:
+    start = datetime.strptime(START_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+    train_end = datetime.strptime(TRAIN_END_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ) + timedelta(days=1) - timedelta(seconds=1)
+    oos_start = datetime.strptime(TRAIN_END_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ) + timedelta(days=1)
+    end = datetime.strptime(END_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ) + timedelta(days=1) - timedelta(seconds=1)
+
+    train_years = max(1e-9, (train_end - start).total_seconds() / (365.25 * 24 * 3600))
+    oos_years = max(1e-9, (end - oos_start).total_seconds() / (365.25 * 24 * 3600)) if end > oos_start else 1e-9
+    return train_years, oos_years
+
+
+def pct_to_cagr(pct_return: float, years: float) -> float:
+    if years <= 0:
+        return 0.0
+    base = 1.0 + (pct_return / 100.0)
+    if base <= 0:
+        return -100.0
+    return (base ** (1.0 / years) - 1.0) * 100.0
+
+
+# ==============================
+# Fixed best-known filter (optional)
+# ==============================
+
+def fixed_best_filter_masks(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, str]:
+    """
+    Implements:
+      cal:skip_0100_0700:both  (local time)
+      rsi:slope_pos_long_slope_neg_short
+    """
+    minutes = df["minute_of_day"].to_numpy(dtype=np.int32)
+    # Skip 01:00 - 07:00
+    in_skip = (minutes >= 60) & (minutes < 420)
+    cal_allow = ~in_skip
+
+    rsi_slope = df["rsi_slope"].to_numpy(dtype=np.float64)
+    rsi_allow_long = rsi_slope > 0.0
+    rsi_allow_short = rsi_slope < 0.0
+
+    long_mask = cal_allow & rsi_allow_long
+    short_mask = cal_allow & rsi_allow_short
+
+    label = "cal:skip_0100_0700:both|ind:rsi_slope_pos_long_neg_short"
+    return long_mask, short_mask, label
+
+
+# ==============================
+# Support/Resistance config
+# ==============================
+
+@dataclass(frozen=True)
+class SRConfig:
+    sr_type: str         # "pivot" / "swing" / "fib" / "kmeans"
+    name: str            # readable variant label (method+params)
+    near_atr_mult: float # how close is "near" (ATR multiple)
+
+    def id(self) -> str:
+        return f"sr:{self.sr_type}:{self.name}:near_{self.near_atr_mult}xATR"
+
+
+# ==============================
+# SR Helpers (no lookahead)
+# ==============================
+
+def _compute_nearest_support_resistance(entry: np.ndarray, levels_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Given:
+      entry: shape (n,)
+      levels_2d: shape (n, m)
+
+    Returns:
+      support: max(level <= entry)
+      resistance: min(level >= entry)
+    """
+    # support
+    sup = np.nanmax(np.where(levels_2d <= entry[:, None], levels_2d, np.nan), axis=1)
+    res = np.nanmin(np.where(levels_2d >= entry[:, None], levels_2d, np.nan), axis=1)
+    return sup, res
+
+
+def sr_allow_masks_from_support_resistance(
+    entry_long: np.ndarray,
+    entry_short: np.ndarray,
+    atr: np.ndarray,
+    support_for_short: np.ndarray,
+    resistance_for_long: np.ndarray,
+    near_atr_mult: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Your rule:
+      - SHORT: if entry is near support and has NOT broken below -> skip
+      - LONG : if entry is near resistance and has NOT broken above -> skip
+
+    We treat "broken" as:
+      - SHORT allowed if entry_short < support (or support is NaN)
+      - LONG allowed if entry_long > resistance (or resistance is NaN)
+
+    Because we choose support as max(level <= entry) and resistance as min(level >= entry),
+    "broken" is naturally handled:
+      - If entry is below all supports => support=NaN => allow
+      - If entry is above all resistances => resistance=NaN => allow
+    """
+    thr = atr * near_atr_mult
+
+    # SHORT: near support if (entry - support) <= thr, but only when support exists
+    near_sup = np.isfinite(support_for_short) & np.isfinite(thr) & ((entry_short - support_for_short) <= thr)
+    allow_short = ~near_sup
+
+    # LONG: near resistance if (resistance - entry) <= thr, but only when resistance exists
+    near_res = np.isfinite(resistance_for_long) & np.isfinite(thr) & ((resistance_for_long - entry_long) <= thr)
+    allow_long = ~near_res
+
+    return allow_long.astype(np.bool_), allow_short.astype(np.bool_)
+
+
+# ------------------------------
+# Pivot points (daily/weekly)
+# ------------------------------
+
+def prev_period_ohlc(df: pd.DataFrame, freq: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Past-only OHLC of previous period (shift(1)).
+    freq: "D" (day), "W" (week), "M" (month)
+
+    Note: DatetimeIndex.to_period drops timezone with a warning, but uses the local wall-time,
+    which is what we want for daily/weekly boundaries in LOCAL_TZ.
+    """
+    period = df.index.to_period(freq)
+    grouped = df.groupby(period).agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+    prev = grouped.shift(1)
+    prev_aligned = prev.loc[period]  # broadcast back to bar index (duplicate indexer)
+    return (
+        prev_aligned["open"].to_numpy(dtype=np.float64),
+        prev_aligned["high"].to_numpy(dtype=np.float64),
+        prev_aligned["low"].to_numpy(dtype=np.float64),
+        prev_aligned["close"].to_numpy(dtype=np.float64),
+    )
+
+
+def pivot_levels(method: str, prev_o: np.ndarray, prev_h: np.ndarray, prev_l: np.ndarray, prev_c: np.ndarray) -> np.ndarray:
+    """
+    Returns levels_2d of shape (n, m) containing both support/resistance candidates.
+    We'll compute nearest support/resistance from these.
+    """
+    H = prev_h
+    L = prev_l
+    C = prev_c
+    O = prev_o
+
+    P = (H + L + C) / 3.0
+    rng = (H - L)
+
+    if method == "classic":
+        R1 = 2 * P - L
+        S1 = 2 * P - H
+        R2 = P + rng
+        S2 = P - rng
+        R3 = H + 2 * (P - L)
+        S3 = L - 2 * (H - P)
+        levels = np.column_stack([S3, S2, S1, P, R1, R2, R3])
+        return levels
+
+    if method == "fibonacci":
+        R1 = P + 0.382 * rng
+        S1 = P - 0.382 * rng
+        R2 = P + 0.618 * rng
+        S2 = P - 0.618 * rng
+        R3 = P + 1.000 * rng
+        S3 = P - 1.000 * rng
+        levels = np.column_stack([S3, S2, S1, P, R1, R2, R3])
+        return levels
+
+    if method == "camarilla":
+        # Common Camarilla multipliers
+        m = 1.1
+        R1 = C + rng * (m / 12.0)
+        R2 = C + rng * (m / 6.0)
+        R3 = C + rng * (m / 4.0)
+        R4 = C + rng * (m / 2.0)
+        S1 = C - rng * (m / 12.0)
+        S2 = C - rng * (m / 6.0)
+        S3 = C - rng * (m / 4.0)
+        S4 = C - rng * (m / 2.0)
+        levels = np.column_stack([S4, S3, S2, S1, C, R1, R2, R3, R4])
+        return levels
+
+    if method == "woodie":
+        P2 = (H + L + 2.0 * C) / 4.0
+        R1 = 2 * P2 - L
+        S1 = 2 * P2 - H
+        R2 = P2 + rng
+        S2 = P2 - rng
+        levels = np.column_stack([S2, S1, P2, R1, R2])
+        return levels
+
+    if method == "demark":
+        # DeMark uses previous open too
+        X = np.where(C < O, H + 2 * L + C, np.where(C > O, 2 * H + L + C, H + L + 2 * C))
+        P3 = X / 4.0
+        R1 = X / 2.0 - L
+        S1 = X / 2.0 - H
+        levels = np.column_stack([S1, P3, R1])
+        return levels
+
+    raise ValueError(f"Unknown pivot method: {method}")
+
+
+# ------------------------------
+# Swing High/Low (rolling)
+# ------------------------------
+
+def swing_support_resistance(df: pd.DataFrame, lookback: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Past-only swing levels:
+      support = rolling min(low, lookback) shifted(1)
+      resistance = rolling max(high, lookback) shifted(1)
+    """
+    sup = df["low"].rolling(lookback).min().shift(1).to_numpy(dtype=np.float64)
+    res = df["high"].rolling(lookback).max().shift(1).to_numpy(dtype=np.float64)
+    return sup, res
+
+
+# ------------------------------
+# Fibonacci retracement levels
+# ------------------------------
+
+_FIB_SETS: Dict[str, List[float]] = {
+    # Standard retracement + full range
+    "retr": [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0],
+    # Add common extensions (and small negative for breakdown/breakout context)
+    "ext":  [-0.618, -0.272, 0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618],
+}
+
+
+def fib_support_resistance(df: pd.DataFrame, lookback: int, fib_set: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Builds a grid of fib levels from past-only rolling high/low (shifted(1)),
+    then picks nearest support/resistance relative to entry.
+
+    Note: We do NOT assume direction; fib levels are used as generic horizontal levels.
+    """
+    if fib_set not in _FIB_SETS:
+        raise ValueError(f"Unknown fib_set: {fib_set}")
+
+    low = df["low"].rolling(lookback).min().shift(1).to_numpy(dtype=np.float64)
+    high = df["high"].rolling(lookback).max().shift(1).to_numpy(dtype=np.float64)
+    rng = high - low
+
+    ps = np.array(_FIB_SETS[fib_set], dtype=np.float64)
+    # levels: low + p * range
+    # shape (n, m)
+    levels = low[:, None] + rng[:, None] * ps[None, :]
+
+    # We'll compute nearest support/resistance later per entry price.
+    # Return levels bounds as (low/high) and let caller compute nearest sup/res for long/short entry prices.
+    # Here we return "levels" to allow reuse, but to keep memory lower, we'll compute nearest here for close?
+    # We'll compute nearest later with _compute_nearest_support_resistance.
+    return low, high, levels
+
+
+# ------------------------------
+# Optional: K-means price levels (slow)
+# ------------------------------
+
+def kmeans_1d(x: np.ndarray, k: int, n_iter: int = 15, seed: int = 0) -> np.ndarray:
+    """
+    Lightweight 1D k-means (no sklearn).
+    x: shape (n,)
+    returns sorted centers shape (k,)
+    """
+    if x.size == 0:
+        return np.full(k, np.nan)
+    rng = np.random.default_rng(seed)
+
+    # init with quantiles (stable) + small jitter
+    qs = np.linspace(0.0, 1.0, k + 2)[1:-1]
+    centers = np.quantile(x, qs)
+    centers = centers + rng.normal(0, np.std(x) * 1e-6, size=k)
+
+    for _ in range(n_iter):
+        # assign
+        d = np.abs(x[:, None] - centers[None, :])
+        idx = np.argmin(d, axis=1)
+        new_centers = centers.copy()
+        for j in range(k):
+            mask = idx == j
+            if np.any(mask):
+                new_centers[j] = x[mask].mean()
+        if np.allclose(new_centers, centers, rtol=1e-6, atol=1e-9):
+            centers = new_centers
+            break
+        centers = new_centers
+
+    return np.sort(centers)
+
+
+def kmeans_levels_for_bars(
+    close: np.ndarray,
+    update_every: int,
+    window: int,
+    k: int,
+    max_updates: int,
+) -> np.ndarray:
+    """
+    Compute k-means centers on a rolling schedule (past-only).
+    Returns levels_2d shape (n, k) where each bar gets the most recent centers.
+
+    Past-only rule:
+      centers at bar i use closes from [i-window, i) (i excluded).
+    """
+    n = close.shape[0]
+    levels = np.full((n, k), np.nan, dtype=np.float64)
+
+    updates = 0
+    last_centers = np.full(k, np.nan, dtype=np.float64)
+
+    for i in range(n):
+        if i >= window and (i % update_every == 0) and (updates < max_updates):
+            x = close[i - window:i].astype(np.float64)
+            last_centers = kmeans_1d(x, k=k, n_iter=15, seed=updates + 1)
+            updates += 1
+        levels[i, :] = last_centers
+
+    return levels
+
+
+# ==============================
+# Evaluation helpers
+# ==============================
+
+def evaluate_signals(
+    o: np.ndarray,
+    h: np.ndarray,
+    l: np.ndarray,
+    c: np.ndarray,
+    long_sig: np.ndarray,
+    short_sig: np.ndarray,
+    seg: slice,
+) -> Dict[str, float]:
+    if seg.stop is not None and seg.stop - (seg.start or 0) < 5:
+        return {
+            "total_trades": 0.0,
+            "win_rate": 0.0,
+            "simple_return_pct": 0.0,
+            "compounded_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "sharpe_ratio": 0.0,
+            "profit_factor": 0.0,
+            "avg_trade_return_pct": 0.0,
+            "final_equity": INITIAL_CAPITAL,
+        }
+
+    (
+        total_trades,
+        win_rate,
+        simple_ret_pct,
+        cmpd_ret_pct,
+        max_dd_pct,
+        sharpe,
+        profit_factor,
+        avg_return_pct,
+        final_equity,
+    ) = _simulate_one(
+        o[seg], h[seg], l[seg], c[seg],
+        long_sig[seg].astype(np.bool_),
+        short_sig[seg].astype(np.bool_),
+        INITIAL_CAPITAL,
+        RISK_PER_TRADE,
+        TAKE_PROFIT_R_MULTIPLE,
+        BROKERAGE_HALF_RATE,
+        SLIPPAGE_HALF_RATE,
+    )
+
+    return {
+        "total_trades": float(total_trades),
+        "win_rate": float(win_rate),
+        "simple_return_pct": float(simple_ret_pct),
+        "compounded_return_pct": float(cmpd_ret_pct),
+        "max_drawdown_pct": float(max_dd_pct),
+        "sharpe_ratio": float(sharpe),
+        "profit_factor": float(profit_factor),
+        "avg_trade_return_pct": float(avg_return_pct),
+        "final_equity": float(final_equity),
+    }
+
+
+def make_result_row(
+    timeframe: str,
+    cfg: SRConfig,
+    base_filter_label: str,
+    full_m: Dict[str, float],
+    train_m: Dict[str, float],
+    oos_m: Dict[str, float],
+    train_years: float,
+    oos_years: float,
+) -> Dict:
+    train_cagr = pct_to_cagr(train_m["compounded_return_pct"], train_years)
+    oos_cagr = pct_to_cagr(oos_m["compounded_return_pct"], oos_years)
+    robust_cagr = min(train_cagr, oos_cagr)
+    avg_cagr = 0.5 * (train_cagr + oos_cagr)
+
+    return {
+        "symbol": SYMBOL,
+        "timeframe": timeframe,
+        "sr_config_id": cfg.id(),
+        "sr_type": cfg.sr_type,
+        "sr_name": cfg.name,
+        "near_atr_mult": cfg.near_atr_mult,
+        "base_filter": base_filter_label,
+
+        "full_trades": full_m["total_trades"],
+        "full_win_rate": full_m["win_rate"],
+        "full_cmpd_ret_pct": full_m["compounded_return_pct"],
+        "full_max_dd_pct": full_m["max_drawdown_pct"],
+
+        "train_trades": train_m["total_trades"],
+        "train_win_rate": train_m["win_rate"],
+        "train_cmpd_ret_pct": train_m["compounded_return_pct"],
+        "train_cagr_pct": train_cagr,
+
+        "oos_trades": oos_m["total_trades"],
+        "oos_win_rate": oos_m["win_rate"],
+        "oos_cmpd_ret_pct": oos_m["compounded_return_pct"],
+        "oos_cagr_pct": oos_cagr,
+
+        "robust_cagr_pct": robust_cagr,
+        "avg_cagr_pct": avg_cagr,
+    }
+
+
+# ==============================
+# Detailed trade log for best config (Python, readable)
+# ==============================
+
+def backtest_detailed(
+    df: pd.DataFrame,
+    long_signal: pd.Series,
+    short_signal: pd.Series,
+    timeframe: str,
+    meta: Dict[str, str],
+) -> List[Dict]:
+    trades: List[Dict] = []
+    equity = INITIAL_CAPITAL
+    current_trade = None
+
+    times = df.index.to_list()
+
+    for i in range(1, len(df)):
+        time_i = times[i]
+        row = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        bar_high = float(row["high"])
+        bar_low = float(row["low"])
+
+        if current_trade is not None:
+            side = current_trade["side"]
+            stop_loss = float(current_trade["stop_loss"])
+            target = float(current_trade["target"])
+            entry_price = float(current_trade["entry_price"])
+            risk_per_unit = float(current_trade["risk_per_unit"])
+
+            # Update MFE/MAE in R
+            if risk_per_unit > 0:
+                if side == "long":
+                    favourable = (bar_high - entry_price) / risk_per_unit
+                    adverse = (entry_price - bar_low) / risk_per_unit
+                else:
+                    favourable = (entry_price - bar_low) / risk_per_unit
+                    adverse = (bar_high - entry_price) / risk_per_unit
+
+                current_trade["mfe_r"] = max(float(current_trade["mfe_r"]), favourable)
+                current_trade["mae_r"] = max(float(current_trade["mae_r"]), adverse)
+
+            exit_price_raw = None
+            exit_reason = None
+
+            if side == "long":
+                stop_hit = bar_low <= stop_loss
+                target_hit = bar_high >= target
+                if stop_hit and target_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop+target_same_bar_stop_first"
+                elif stop_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop"
+                elif target_hit:
+                    exit_price_raw = target
+                    exit_reason = "target"
+            else:
+                stop_hit = bar_high >= stop_loss
+                target_hit = bar_low <= target
+                if stop_hit and target_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop+target_same_bar_stop_first"
+                elif stop_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop"
+                elif target_hit:
+                    exit_price_raw = target
+                    exit_reason = "target"
+
+            if exit_price_raw is not None:
+                side = current_trade["side"]
+                entry_price = float(current_trade["entry_price"])
+                size = float(current_trade["size"])
+                entry_equity = float(current_trade["equity_at_entry"])
+
+                # slippage
+                if side == "long":
+                    entry_price_eff = entry_price * (1.0 + SLIPPAGE_HALF_RATE)
+                    exit_price_eff = float(exit_price_raw) * (1.0 - SLIPPAGE_HALF_RATE)
+                    gross_pnl = (exit_price_eff - entry_price_eff) * size
+                else:
+                    entry_price_eff = entry_price * (1.0 - SLIPPAGE_HALF_RATE)
+                    exit_price_eff = float(exit_price_raw) * (1.0 + SLIPPAGE_HALF_RATE)
+                    gross_pnl = (entry_price_eff - exit_price_eff) * size
+
+                # brokerage
+                cost_entry = abs(entry_price_eff * size) * BROKERAGE_HALF_RATE
+                cost_exit = abs(exit_price_eff * size) * BROKERAGE_HALF_RATE
+                brokerage_cost = cost_entry + cost_exit
+
+                net_pnl = gross_pnl - brokerage_cost
+                trade_return = net_pnl / entry_equity if entry_equity != 0 else 0.0
+                equity = equity * (1.0 + trade_return)
+
+                r_multiple = trade_return / RISK_PER_TRADE if RISK_PER_TRADE > 0 else 0.0
+
+                trades.append({
+                    "symbol": SYMBOL,
+                    "timeframe": timeframe,
+                    "entry_time": current_trade["entry_time"],
+                    "exit_time": time_i,
+                    "side": side,
+                    "entry_price_raw": entry_price,
+                    "exit_price_raw": float(exit_price_raw),
+                    "entry_price_eff": entry_price_eff,
+                    "exit_price_eff": exit_price_eff,
+                    "stop_loss": float(current_trade["stop_loss"]),
+                    "target": float(current_trade["target"]),
+                    "size": size,
+                    "risk_per_unit": float(current_trade["risk_per_unit"]),
+                    "mfe_r": float(current_trade["mfe_r"]),
+                    "mae_r": float(current_trade["mae_r"]),
+                    "gross_pnl": gross_pnl,
+                    "brokerage_cost": brokerage_cost,
+                    "pnl": net_pnl,
+                    "return_pct": trade_return * 100.0,
+                    "r_multiple": r_multiple,
+                    "exit_reason": exit_reason,
+                    "equity_after": equity,
+                    # meta
+                    **meta,
+                })
+
+                current_trade = None
+                continue
+
+        # New entries based on previous candle
+        if current_trade is None:
+            if bool(long_signal.iloc[i - 1]):
+                entry_price = float(prev_row["high"])
+                stop_loss = float(prev_row["low"])
+                risk_per_unit = entry_price - stop_loss
+                if risk_per_unit > 0 and bar_high >= entry_price:
+                    equity_at_entry = equity
+                    risk_amount = equity_at_entry * RISK_PER_TRADE
+                    size = risk_amount / risk_per_unit
+                    target = entry_price + TAKE_PROFIT_R_MULTIPLE * risk_per_unit
+                    current_trade = {
+                        "side": "long",
+                        "entry_time": time_i,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target": target,
+                        "size": size,
+                        "equity_at_entry": equity_at_entry,
+                        "risk_per_unit": risk_per_unit,
+                        "mfe_r": 0.0,
+                        "mae_r": 0.0,
+                    }
+                    continue
+
+            if bool(short_signal.iloc[i - 1]):
+                entry_price = float(prev_row["low"])
+                stop_loss = float(prev_row["high"])
+                risk_per_unit = stop_loss - entry_price
+                if risk_per_unit > 0 and bar_low <= entry_price:
+                    equity_at_entry = equity
+                    risk_amount = equity_at_entry * RISK_PER_TRADE
+                    size = risk_amount / risk_per_unit
+                    target = entry_price - TAKE_PROFIT_R_MULTIPLE * risk_per_unit
+                    current_trade = {
+                        "side": "short",
+                        "entry_time": time_i,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target": target,
+                        "size": size,
+                        "equity_at_entry": equity_at_entry,
+                        "risk_per_unit": risk_per_unit,
+                        "mfe_r": 0.0,
+                        "mae_r": 0.0,
+                    }
+                    continue
+
+    # EOD close
+    if current_trade is not None:
+        last_time = times[-1]
+        last_close = float(df.iloc[-1]["close"])
+        side = current_trade["side"]
+        entry_price = float(current_trade["entry_price"])
+        size = float(current_trade["size"])
+        entry_equity = float(current_trade["equity_at_entry"])
+
+        if side == "long":
+            entry_price_eff = entry_price * (1.0 + SLIPPAGE_HALF_RATE)
+            exit_price_eff = last_close * (1.0 - SLIPPAGE_HALF_RATE)
+            gross_pnl = (exit_price_eff - entry_price_eff) * size
+        else:
+            entry_price_eff = entry_price * (1.0 - SLIPPAGE_HALF_RATE)
+            exit_price_eff = last_close * (1.0 + SLIPPAGE_HALF_RATE)
+            gross_pnl = (entry_price_eff - exit_price_eff) * size
+
+        cost_entry = abs(entry_price_eff * size) * BROKERAGE_HALF_RATE
+        cost_exit = abs(exit_price_eff * size) * BROKERAGE_HALF_RATE
+        brokerage_cost = cost_entry + cost_exit
+        net_pnl = gross_pnl - brokerage_cost
+
+        trade_return = net_pnl / entry_equity if entry_equity != 0 else 0.0
+        equity = equity * (1.0 + trade_return)
+        r_multiple = trade_return / RISK_PER_TRADE if RISK_PER_TRADE > 0 else 0.0
+
+        trades.append({
+            "symbol": SYMBOL,
+            "timeframe": timeframe,
+            "entry_time": current_trade["entry_time"],
+            "exit_time": last_time,
+            "side": side,
+            "entry_price_raw": entry_price,
+            "exit_price_raw": last_close,
+            "entry_price_eff": entry_price_eff,
+            "exit_price_eff": exit_price_eff,
+            "stop_loss": float(current_trade["stop_loss"]),
+            "target": float(current_trade["target"]),
+            "size": size,
+            "risk_per_unit": float(current_trade["risk_per_unit"]),
+            "mfe_r": float(current_trade["mfe_r"]),
+            "mae_r": float(current_trade["mae_r"]),
+            "gross_pnl": gross_pnl,
+            "brokerage_cost": brokerage_cost,
+            "pnl": net_pnl,
+            "return_pct": trade_return * 100.0,
+            "r_multiple": r_multiple,
+            "exit_reason": "eod",
+            "equity_after": equity,
+            **meta,
+        })
+
+    return trades
+
+
+# ==============================
+# SR Optimizer
+# ==============================
+
+def logspace_ints(min_v: int, max_v: int, n: int) -> List[int]:
+    vals = np.logspace(np.log10(min_v), np.log10(max_v), n)
+    ints = np.unique(np.round(vals).astype(int))
+    ints = ints[(ints >= min_v) & (ints <= max_v)]
+    return ints.tolist()
+
+
+def generate_sr_configs() -> Tuple[List[Tuple[str, dict]], int]:
+    """
+    We return a "plan" list of (family, params) items, processed sequentially to keep memory low.
+    Each item expands into multiple SRConfig by near_atr_mult.
+
+    family can be:
+      - "pivot"
+      - "swing"
+      - "fib"
+      - "kmeans"
+    """
+    plan: List[Tuple[str, dict]] = []
+    total = 0
+
+    # Pivot
+    for period in PIVOT_PERIODS:
+        for method in PIVOT_METHODS:
+            plan.append(("pivot", {"period": period, "method": method}))
+            total += len(NEAR_ATR_MULTIPLES)
+
+    # Swing lookbacks
+    swing_lbs = logspace_ints(SWING_MIN_LB, SWING_MAX_LB, SWING_N_LBS)
+    for lb in swing_lbs:
+        plan.append(("swing", {"lookback": int(lb)}))
+        total += len(NEAR_ATR_MULTIPLES)
+
+    # Fib lookbacks
+    fib_lbs = swing_lbs if FIB_REUSE_SWING_LOOKBACKS else logspace_ints(SWING_MIN_LB, SWING_MAX_LB, FIB_N_LBS)
+    for lb in fib_lbs:
+        for fib_set in ("retr", "ext"):
+            plan.append(("fib", {"lookback": int(lb), "fib_set": fib_set}))
+            total += len(NEAR_ATR_MULTIPLES)
+
+    # Optional kmeans
+    if ENABLE_KMEANS_SR:
+        for window in KMEANS_WINDOWS:
+            for k in KMEANS_KS:
+                plan.append(("kmeans", {"window": int(window), "k": int(k), "update_every": int(KMEANS_UPDATE_EVERY_BARS)}))
+                total += len(NEAR_ATR_MULTIPLES)
+
+    return plan, total
+
+
+def run_sr_optimizer(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    if njit is None:
+        raise RuntimeError("Numba is required. Install: pip install numba")
+
+    n = len(df)
+
+    # Precompute OHLC arrays once
+    o = df["open"].to_numpy(dtype=np.float64)
+    h = df["high"].to_numpy(dtype=np.float64)
+    l = df["low"].to_numpy(dtype=np.float64)
+    c = df["close"].to_numpy(dtype=np.float64)
+
+    atr = df["atr_14"].to_numpy(dtype=np.float64)
+
+    # Entry prices defined by your stop-entry model (signal candle high/low)
+    entry_long = h.copy()
+    entry_short = l.copy()
+
+    # Base signals
+    long_base = df["long_signal_raw"].to_numpy(dtype=np.bool_)
+    short_base = df["short_signal_raw"].to_numpy(dtype=np.bool_)
+
+    base_filter_label = "base_only"
+    if APPLY_FIXED_BEST_FILTER:
+        long_fix, short_fix, base_filter_label = fixed_best_filter_masks(df)
+        long_base = long_base & long_fix
+        short_base = short_base & short_fix
+        print(f"Applied fixed best filter => remaining signals: long={int(long_base.sum())}, short={int(short_base.sum())}")
+
+    # Slices
+    train_slice, oos_slice = compute_train_test_slices(n, df.index)
+    train_years, oos_years = _segment_years()
+
+    plan, total_cfgs = generate_sr_configs()
+    print(f"\nSR Optimizer plan items: {len(plan)}  |  total SR configs (with thresholds): {total_cfgs}")
+    if total_cfgs < 1000:
+        print("WARNING: total SR configs is < 1000. Increase lookbacks or thresholds to satisfy your requirement.")
+
+    results: List[Dict] = []
+
+    def eval_cfg(cfg: SRConfig, allow_long: np.ndarray, allow_short: np.ndarray) -> None:
+        long_sig = long_base & allow_long
+        short_sig = short_base & allow_short
+
+        full_m = evaluate_signals(o, h, l, c, long_sig, short_sig, slice(0, n))
+        train_m = evaluate_signals(o, h, l, c, long_sig, short_sig, train_slice)
+        oos_m = evaluate_signals(o, h, l, c, long_sig, short_sig, oos_slice)
+
+        results.append(make_result_row(timeframe, cfg, base_filter_label, full_m, train_m, oos_m, train_years, oos_years))
+
+    # Process plan sequentially to keep memory low
+    processed = 0
+    for family, params in plan:
+        processed += 1
+
+        if family == "pivot":
+            period = str(params["period"])
+            method = str(params["method"])
+
+            prev_o, prev_h, prev_l, prev_c = prev_period_ohlc(df, period)
+            levels = pivot_levels(method, prev_o, prev_h, prev_l, prev_c)
+
+            # For SHORT: support relative to entry_short
+            sup_short, _ = _compute_nearest_support_resistance(entry_short, levels)
+            # For LONG : resistance relative to entry_long
+            _, res_long = _compute_nearest_support_resistance(entry_long, levels)
+
+            for near_mult in NEAR_ATR_MULTIPLES:
+                cfg = SRConfig("pivot", f"{period}_{method}", float(near_mult))
+                allow_long, allow_short = sr_allow_masks_from_support_resistance(
+                    entry_long, entry_short, atr, sup_short, res_long, float(near_mult)
+                )
+                eval_cfg(cfg, allow_long, allow_short)
+
+        elif family == "swing":
+            lb = int(params["lookback"])
+            sup, res = swing_support_resistance(df, lb)
+
+            for near_mult in NEAR_ATR_MULTIPLES:
+                cfg = SRConfig("swing", f"lb{lb}", float(near_mult))
+                allow_long, allow_short = sr_allow_masks_from_support_resistance(
+                    entry_long, entry_short, atr, sup, res, float(near_mult)
+                )
+                eval_cfg(cfg, allow_long, allow_short)
+
+        elif family == "fib":
+            lb = int(params["lookback"])
+            fib_set = str(params["fib_set"])
+
+            # Build fib level grid (past-only). Returns low/high + full levels grid
+            _, _, levels = fib_support_resistance(df, lb, fib_set)
+
+            sup_short, _ = _compute_nearest_support_resistance(entry_short, levels)
+            _, res_long = _compute_nearest_support_resistance(entry_long, levels)
+
+            for near_mult in NEAR_ATR_MULTIPLES:
+                cfg = SRConfig("fib", f"lb{lb}_{fib_set}", float(near_mult))
+                allow_long, allow_short = sr_allow_masks_from_support_resistance(
+                    entry_long, entry_short, atr, sup_short, res_long, float(near_mult)
+                )
+                eval_cfg(cfg, allow_long, allow_short)
+
+        elif family == "kmeans":
+            if not ENABLE_KMEANS_SR:
+                continue
+            window = int(params["window"])
+            k = int(params["k"])
+            update_every = int(params["update_every"])
+
+            levels = kmeans_levels_for_bars(c, update_every=update_every, window=window, k=k, max_updates=KMEANS_MAX_UPDATES)
+
+            sup_short, _ = _compute_nearest_support_resistance(entry_short, levels)
+            _, res_long = _compute_nearest_support_resistance(entry_long, levels)
+
+            for near_mult in NEAR_ATR_MULTIPLES:
+                cfg = SRConfig("kmeans", f"win{window}_k{k}_u{update_every}", float(near_mult))
+                allow_long, allow_short = sr_allow_masks_from_support_resistance(
+                    entry_long, entry_short, atr, sup_short, res_long, float(near_mult)
+                )
+                eval_cfg(cfg, allow_long, allow_short)
+
+        else:
+            raise ValueError(f"Unknown family: {family}")
+
+        if processed % 25 == 0:
+            print(f"  processed plan items: {processed}/{len(plan)}  |  results rows: {len(results)}")
+
+    out_df = pd.DataFrame(results)
+
+    # Validity flags
+    out_df["valid_full"] = out_df["full_trades"] >= MIN_TRADES_FULL_FOR_RANK
+    out_df["valid_train"] = out_df["train_trades"] >= MIN_TRADES_TRAIN_FOR_RANK
+    out_df["valid_oos"] = out_df["oos_trades"] >= MIN_TRADES_OOS_FOR_RANK
+
+    if REQUIRE_POSITIVE_TRAIN_AND_OOS:
+        out_df["valid_return"] = (out_df["train_cmpd_ret_pct"] > 0) & (out_df["oos_cmpd_ret_pct"] > 0)
+    else:
+        out_df["valid_return"] = True
+
+    # Ranking
+    out_df = out_df.sort_values(
+        ["valid_oos", "valid_train", "valid_full", "valid_return",
+         "robust_cagr_pct", "avg_cagr_pct", "oos_cagr_pct",
+         "oos_trades", "train_trades"],
+        ascending=[False, False, False, False, False, False, False, False, False],
+    ).reset_index(drop=True)
+
+    print("\nTop 10 SR configs (ranked by robust_cagr_pct = min(train_cagr, oos_cagr)):")
+    show_cols = [
+        "robust_cagr_pct", "avg_cagr_pct",
+        "train_cagr_pct", "oos_cagr_pct",
+        "train_cmpd_ret_pct", "oos_cmpd_ret_pct",
+        "train_trades", "oos_trades",
+        "sr_type", "sr_name", "near_atr_mult",
+        "base_filter",
+    ]
+    print(out_df.head(10)[show_cols].to_string(index=False))
+
+    return out_df
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main() -> None:
+    if njit is None:
+        raise RuntimeError("Numba is required. Install: pip install numba")
+
+    all_results: List[pd.DataFrame] = []
+
+    for res in TIMEFRAMES:
+        print("\n==============================================")
+        print(f"Running timeframe: {res}")
+        print("==============================================")
+
+        df = fetch_ohlc_from_delta(SYMBOL, res, START_DATE, END_DATE)
+        df = add_indicators(df, resolution=res)
+        df = build_base_signals(df)
+
+        results_df = run_sr_optimizer(df, res)
+        all_results.append(results_df)
+
+    final_df = pd.concat(all_results, ignore_index=True)
+
+    # Global re-sort (important if multiple timeframes)
+    final_df = final_df.sort_values(
+        ["valid_oos", "valid_train", "valid_full", "valid_return",
+         "robust_cagr_pct", "avg_cagr_pct", "oos_cagr_pct",
+         "oos_trades", "train_trades"],
+        ascending=[False, False, False, False, False, False, False, False, False],
+    ).reset_index(drop=True)
+
+    final_df.to_csv(RESULTS_SUMMARY_CSV_PATH, index=False)
+    print(f"\nSaved SR summary results to: {RESULTS_SUMMARY_CSV_PATH} ({len(final_df)} rows)")
+
+    # Save TOP-N configs
+    top_n = int(min(TOP_N_TO_SAVE, len(final_df)))
+    top_cols = [
+        "symbol", "timeframe",
+        "sr_config_id", "sr_type", "sr_name", "near_atr_mult",
+        "base_filter",
+        "robust_cagr_pct", "avg_cagr_pct",
+        "train_cagr_pct", "oos_cagr_pct",
+        "train_cmpd_ret_pct", "oos_cmpd_ret_pct", "full_cmpd_ret_pct",
+        "train_trades", "oos_trades", "full_trades",
+        "train_win_rate", "oos_win_rate", "full_win_rate",
+        "full_max_dd_pct",
+        "valid_train", "valid_oos", "valid_full", "valid_return",
+    ]
+    final_df.head(top_n)[top_cols].to_csv(TOP_FILTERS_CSV_PATH, index=False)
+    print(f"Saved top {top_n} SR configs to: {TOP_FILTERS_CSV_PATH}")
+
+    # Best config trades CSV
+    best = final_df.iloc[0]
+    best_sr_type = str(best["sr_type"])
+    best_sr_name = str(best["sr_name"])
+    best_near = float(best["near_atr_mult"])
+    best_base_filter = str(best["base_filter"])
+
+    print("\nBest SR config:")
+    print(best[top_cols].to_string())
+
+    # Recompute candles & signals (cached) for trade log
+    res0 = TIMEFRAMES[0]
+    df0 = fetch_ohlc_from_delta(SYMBOL, res0, START_DATE, END_DATE)
+    df0 = add_indicators(df0, resolution=res0)
+    df0 = build_base_signals(df0)
+
+    n0 = len(df0)
+    o0 = df0["open"].to_numpy(dtype=np.float64)
+    h0 = df0["high"].to_numpy(dtype=np.float64)
+    l0 = df0["low"].to_numpy(dtype=np.float64)
+    c0 = df0["close"].to_numpy(dtype=np.float64)
+    atr0 = df0["atr_14"].to_numpy(dtype=np.float64)
+    entry_long0 = h0.copy()
+    entry_short0 = l0.copy()
+
+    long_base0 = df0["long_signal_raw"].to_numpy(dtype=np.bool_)
+    short_base0 = df0["short_signal_raw"].to_numpy(dtype=np.bool_)
+
+    if APPLY_FIXED_BEST_FILTER:
+        long_fix0, short_fix0, _ = fixed_best_filter_masks(df0)
+        long_base0 = long_base0 & long_fix0
+        short_base0 = short_base0 & short_fix0
+
+    # Build allow masks for best SR config
+    if best_sr_type == "pivot":
+        # sr_name like "D_classic" or "W_fibonacci"
+        parts = best_sr_name.split("_", 1)
+        period = parts[0]
+        method = parts[1] if len(parts) > 1 else parts[0]
+
+        prev_o, prev_h, prev_l, prev_c = prev_period_ohlc(df0, period)
+        levels = pivot_levels(method, prev_o, prev_h, prev_l, prev_c)
+        sup_short, _ = _compute_nearest_support_resistance(entry_short0, levels)
+        _, res_long = _compute_nearest_support_resistance(entry_long0, levels)
+
+    elif best_sr_type == "swing":
+        # sr_name like "lb240"
+        lb = int(best_sr_name.replace("lb", ""))
+        sup_short, res_long = swing_support_resistance(df0, lb)
+
+    elif best_sr_type == "fib":
+        # sr_name like "lb240_retr"
+        tmp = best_sr_name.split("_")
+        lb = int(tmp[0].replace("lb", ""))
+        fib_set = tmp[1] if len(tmp) > 1 else "retr"
+        _, _, levels = fib_support_resistance(df0, lb, fib_set)
+        sup_short, _ = _compute_nearest_support_resistance(entry_short0, levels)
+        _, res_long = _compute_nearest_support_resistance(entry_long0, levels)
+
+    elif best_sr_type == "kmeans":
+        # sr_name like "win1000_k5_u288"
+        if not ENABLE_KMEANS_SR:
+            raise RuntimeError("Best config is kmeans but ENABLE_KMEANS_SR=False. Re-run with ENABLE_KMEANS_SR=True.")
+        # parse
+        # win{window}_k{k}_u{update}
+        window = int(best_sr_name.split("_")[0].replace("win", ""))
+        k = int(best_sr_name.split("_")[1].replace("k", ""))
+        update_every = int(best_sr_name.split("_")[2].replace("u", ""))
+        levels = kmeans_levels_for_bars(c0, update_every=update_every, window=window, k=k, max_updates=KMEANS_MAX_UPDATES)
+        sup_short, _ = _compute_nearest_support_resistance(entry_short0, levels)
+        _, res_long = _compute_nearest_support_resistance(entry_long0, levels)
+
+    else:
+        raise ValueError(f"Unknown best_sr_type: {best_sr_type}")
+
+    allow_long0, allow_short0 = sr_allow_masks_from_support_resistance(
+        entry_long0, entry_short0, atr0,
+        sup_short, res_long,
+        near_atr_mult=best_near
+    )
+
+    long_sig0 = pd.Series(long_base0 & allow_long0, index=df0.index)
+    short_sig0 = pd.Series(short_base0 & allow_short0, index=df0.index)
+
+    meta = {
+        "sr_type": best_sr_type,
+        "sr_name": best_sr_name,
+        "near_atr_mult": best_near,
+        "base_filter": best_base_filter,
+    }
+
+    trades = backtest_detailed(df0, long_sig0, short_sig0, timeframe=res0, meta=meta)
+    if trades:
+        trades_df = pd.DataFrame(trades)
+        trades_df.to_csv(BEST_TRADES_CSV_PATH, index=False)
+        print(f"\nSaved best SR config trades to: {BEST_TRADES_CSV_PATH} ({len(trades_df)} trades)")
+    else:
+        print("\nBest SR config produced no trades; trades CSV not saved.")
+
+
+if __name__ == "__main__":
+    main()

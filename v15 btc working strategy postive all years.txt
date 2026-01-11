@@ -1,0 +1,1542 @@
+"""
+EMA Pullback Strategy (Delta BTCUSD) + FIXED FILTERS + TRADE MANAGEMENT (No Lookahead)
+===================================================================================
+
+This script is your fixed-filter EMA pullback backtest, including:
+- Your BEST fixed filters:
+      cal:skip_0100_0700:both
+      side:both
+      ind:rsi
+      rsi:slope_pos_long_slope_neg_short
+
+- Your BEST trade-management rules:
+      tpR=5.0
+      beMode=0 (disabled)
+      trailMode=3 (Chandelier ATR)
+      trailATR=1.0
+      trailStartR=0.0 (active immediately)
+      earlyMode=1 (EMA-against exit)
+      lossEMAn=3 (3 consecutive closes against EMA9)
+      timeStop=0 (disabled)
+      cutLossR=0.0 (disabled)
+
+NEW in this version (as requested):
+- Initial capital = 100,000 (1 lakh)
+- Extra performance metrics:
+    * Sharpe ratio (from Numba sim)
+    * Max consecutive winning streak (trades)
+    * Max consecutive losing streak (trades)
+- PnL/Equity curve image saved as PNG
+
+Outputs:
+- btc_fixed_filter_metrics.csv : full/train/oos metrics + streak stats
+- btc_best_filter_trades.csv   : detailed trade list (incl. exit reasons, equity_after)
+- btc_equity_curve.png         : equity curve image
+
+Install:
+  pip install numpy pandas requests numba pyarrow matplotlib
+
+Run:
+  python btc_ema_backtest_apply_best_filters_mgmt_plus.py
+
+DISCLAIMER:
+Research/backtesting only. Not financial advice.
+"""
+
+from __future__ import annotations
+
+import os
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+
+# For the equity curve image
+import matplotlib.pyplot as plt
+
+try:
+    from numba import njit  # type: ignore
+except Exception:  # pragma: no cover
+    njit = None
+
+
+# ==============================
+# CONFIG - EDIT THESE PARAMETERS
+# ==============================
+
+# Backtest date range in LOCAL timezone (IST)
+START_DATE = "2025-01-01"
+END_DATE   = "2025-12-31"
+
+# Train / OOS split (OOS starts next day after TRAIN_END_DATE)
+# NOTE: If TRAIN_END_DATE > END_DATE, then OOS will be empty.
+TRAIN_END_DATE = "2025-12-31"
+
+SYMBOL = "BTCUSD"
+TIMEFRAME = "5m"
+
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
+
+# Capital & risk
+INITIAL_CAPITAL = 100000.0   # 1 lakh (requested)
+RISK_PER_TRADE  = 0.01
+
+# EMA settings
+EMA_SHORT        = 9
+EMA_LONG         = 15
+EMA_TREND_FILTER = 200
+EMA_9_200_MIN_DIST = 0.003
+
+# Trend / slope / angle settings
+EMA_SLOPE_LOOKBACK      = 3
+MIN_SLOPE_PCT           = 0.0001
+EMA_LONG_MIN_ANGLE_DEG  = 33.0
+EMA_LONG_ANGLE_SCALE    = 500.0
+MIN_EMA_SEPARATION_PCT  = 0.0003
+CROSS_LOOKBACK          = 10
+
+# Candle pattern parameters
+PINBAR_WICK_RATIO = 1.2
+PINBAR_MAX_WICK_BODY_RATIO = 1.2
+STRONG_BODY_MIN_BODY_TO_RANGE = 0.4
+
+# Trading costs
+BROKERAGE_TOTAL_RATE = 0.0006
+SLIPPAGE_TOTAL_RATE  = 0.0002
+BROKERAGE_HALF_RATE  = BROKERAGE_TOTAL_RATE / 2.0
+SLIPPAGE_HALF_RATE   = SLIPPAGE_TOTAL_RATE / 2.0
+
+# Delta candles API chunk size
+MAX_CANDLES_PER_REQUEST = 4000
+
+# Output paths
+METRICS_CSV_PATH = "btc_fixed_filter_metrics.csv"
+TRADES_CSV_PATH  = "btc_best_filter_trades.csv"
+EQUITY_PLOT_PATH = "btc_equity_curve.png"
+
+# Optional caching (recommended)
+USE_CACHE = True
+CACHE_DIR = "candle_cache"
+
+# ==============================
+# >>> YOUR FIXED FILTER CONFIG <<<
+# ==============================
+
+CALENDAR_FILTER  = "cal:skip_0100_0700:both"
+SIDE_FILTER      = "side:both"
+INDICATOR_GROUP  = "ind:rsi"
+INDICATOR_FILTER = "rsi:slope_pos_long_slope_neg_short"
+
+# ==============================
+# >>> YOUR TRADE MANAGEMENT RULES <<<
+# ==============================
+
+# Take profit in R
+TP_R_MULTIPLE = 5.0
+
+# Break-even (BE) modes:
+# 0 = none
+# 1 = fixed BE after reaching beTrigR
+# 2 = EMA-cross BE (when EMA9/EMA15 cross against, only if trade is in profit)
+# 3 = both 1 + 2
+BE_MODE    = 0
+BE_TRIG_R  = 0.0
+BE_OFF_R   = 0.0
+
+# Trailing modes:
+# 0 = none
+# 1 = ATR close trail
+# 2 = EMA9 trail (+ optional buffer in ATR)
+# 3 = Chandelier (HH/LL since entry +/- ATR*mult)
+TRAIL_MODE        = 3
+TRAIL_START_R     = 0.0
+TRAIL_ATR_MULT    = 1.0
+TRAIL_EMA_BUF_ATR = 0.0
+
+# Early-exit modes:
+# 0 = none (but can still use cutLossR if you enable it)
+# 1 = EMA-against exit (consecutive closes against EMA9)
+# 2 = time stop (bars)
+# 3 = both 1 + 2 (and cutLossR if enabled)
+EARLY_MODE     = 1
+LOSS_EMA_N     = 3
+TIME_STOP_BARS = 0
+CUT_LOSS_R     = 0.0
+
+
+# ==============================
+# DELTA API (public endpoints)
+# ==============================
+
+DELTA_BASE_URL = "https://api.delta.exchange"
+USER_AGENT = "python-ema-apply-best-filters-mgmt-plus"
+
+
+def delta_request(method: str, path: str, params: Optional[Dict] = None) -> Dict:
+    url = f"{DELTA_BASE_URL}{path}"
+    params = params or {}
+    headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
+    resp = requests.request(method=method, url=url, params=params, timeout=(5, 60), headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(f"Delta API error: {data.get('error')}")
+    return data.get("result", data)
+
+
+def resolution_to_seconds(resolution: str) -> int:
+    res = resolution.strip().lower()
+    unit = res[-1]
+    value = int(res[:-1])
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 60 * 60
+    if unit == "d":
+        return value * 24 * 60 * 60
+    if unit == "w":
+        return value * 7 * 24 * 60 * 60
+    raise ValueError(f"Unsupported resolution: {resolution}")
+
+
+def local_date_range_to_utc_epochs(start_date: str, end_date: str, local_tz: timezone) -> Tuple[int, int]:
+    local_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=local_tz)
+    local_end = (
+        datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=local_tz)
+        + timedelta(days=1) - timedelta(seconds=1)
+    )
+    start_utc = local_start.astimezone(timezone.utc)
+    end_utc = local_end.astimezone(timezone.utc)
+    return int(start_utc.timestamp()), int(end_utc.timestamp())
+
+
+def _cache_path(symbol: str, resolution: str, start_date: str, end_date: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fname = f"{symbol}_{resolution}_{start_date}_{end_date}.parquet"
+    return os.path.join(CACHE_DIR, fname)
+
+
+def fetch_ohlc_from_delta(symbol: str, resolution: str, start_date: str, end_date: str) -> pd.DataFrame:
+    if USE_CACHE:
+        path = _cache_path(symbol, resolution, start_date, end_date)
+        if os.path.exists(path):
+            df = pd.read_parquet(path)
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize(LOCAL_TZ)
+            return df
+
+    start_ts, end_ts = local_date_range_to_utc_epochs(start_date, end_date, LOCAL_TZ)
+    res_seconds = resolution_to_seconds(resolution)
+    max_span = res_seconds * MAX_CANDLES_PER_REQUEST
+
+    all_records: List[Dict] = []
+    print(f"Fetching {symbol} {resolution} candles from {start_date} to {end_date} (LOCAL {LOCAL_TZ})")
+
+    current_start = start_ts
+    path = "/v2/history/candles"
+    while current_start < end_ts:
+        current_end = min(current_start + max_span - 1, end_ts)
+        params = {"symbol": symbol, "resolution": resolution, "start": current_start, "end": current_end}
+        result = delta_request("GET", path, params=params)
+        if not result:
+            break
+        all_records.extend(result)
+        current_start = current_end + 1
+
+    if not all_records:
+        raise RuntimeError("No candle data returned from Delta Exchange for given range.")
+
+    df = pd.DataFrame(all_records)
+    if "time" not in df.columns:
+        raise RuntimeError(f"Unexpected candle format. Columns: {df.columns.tolist()}")
+
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(LOCAL_TZ)
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            raise RuntimeError(f"Expected column '{col}' not found in candles data.")
+        df[col] = df[col].astype(float)
+
+    df = df.sort_values("time").set_index("time")[["open", "high", "low", "close", "volume"]].copy()
+
+    if USE_CACHE:
+        df.to_parquet(_cache_path(symbol, resolution, start_date, end_date))
+
+    print(f"Fetched {len(df)} candles. Range: {df.index[0]} -> {df.index[-1]} (LOCAL)")
+    return df
+
+
+# ==============================
+# INDICATORS (no lookahead)
+# ==============================
+
+def compute_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / window, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / window, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / window, adjust=False).mean()
+
+
+def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1.0 / window, adjust=False).mean()
+    plus_dm_sm = pd.Series(plus_dm, index=high.index).ewm(alpha=1.0 / window, adjust=False).mean()
+    minus_dm_sm = pd.Series(minus_dm, index=high.index).ewm(alpha=1.0 / window, adjust=False).mean()
+
+    plus_di = 100.0 * (plus_dm_sm / atr.replace(0.0, np.nan))
+    minus_di = 100.0 * (minus_dm_sm / atr.replace(0.0, np.nan))
+
+    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    return dx.ewm(alpha=1.0 / window, adjust=False).mean()
+
+
+def add_indicators(df: pd.DataFrame, resolution: str) -> pd.DataFrame:
+    df = df.copy()
+    close = df["close"]
+
+    # EMAs
+    df["ema_short"] = close.ewm(span=EMA_SHORT, adjust=False).mean()
+    df["ema_long"]  = close.ewm(span=EMA_LONG,  adjust=False).mean()
+    df["ema_200"]   = close.ewm(span=EMA_TREND_FILTER, adjust=False).mean()
+
+    # EMA slopes/angles
+    ema_short_prev = df["ema_short"].shift(EMA_SLOPE_LOOKBACK)
+    ema_long_prev  = df["ema_long"].shift(EMA_SLOPE_LOOKBACK)
+
+    slope_short_pct = (df["ema_short"] - ema_short_prev) / ema_short_prev
+    slope_long_pct  = (df["ema_long"]  - ema_long_prev)  / ema_long_prev
+
+    df["slope_short_pct"] = slope_short_pct
+    df["slope_long_pct"]  = slope_long_pct
+
+    df["ema_short_angle_deg"] = np.degrees(np.arctan(slope_short_pct * EMA_LONG_ANGLE_SCALE))
+    df["ema_long_angle_deg"]  = np.degrees(np.arctan(slope_long_pct  * EMA_LONG_ANGLE_SCALE))
+
+    df["ema_sep_pct"] = (df["ema_short"] - df["ema_long"]).abs() / df["close"].replace(0.0, np.nan)
+
+    # recent EMA cross filter
+    df["ema_diff_sign"] = np.sign(df["ema_short"] - df["ema_long"])
+    df["ema_cross"] = df["ema_diff_sign"].ne(df["ema_diff_sign"].shift(1))
+    df["recent_cross"] = df["ema_cross"].rolling(CROSS_LOOKBACK).max().fillna(0).astype(bool)
+
+    df["long_trend"] = (
+        (df["ema_short"] > df["ema_long"]) &
+        (df["slope_long_pct"] > MIN_SLOPE_PCT) &
+        (df["ema_long_angle_deg"] >= EMA_LONG_MIN_ANGLE_DEG) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    df["short_trend"] = (
+        (df["ema_short"] < df["ema_long"]) &
+        (df["slope_long_pct"] < -MIN_SLOPE_PCT) &
+        (df["ema_long_angle_deg"] <= -EMA_LONG_MIN_ANGLE_DEG) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    # RSI / ATR / ADX
+    df["rsi_14"] = compute_rsi(close, 14)
+    df["rsi_slope"] = df["rsi_14"] - df["rsi_14"].shift(1)
+
+    df["atr_14"] = compute_atr(df["high"], df["low"], close, 14)
+    df["atr_pct_14"] = df["atr_14"] / close.replace(0.0, np.nan)
+    df["adx_14"] = compute_adx(df["high"], df["low"], close, 14)
+
+    # EMA9-EMA200 distance
+    df["dist_9_200"] = (df["ema_short"] - df["ema_200"]).abs() / close.replace(0.0, np.nan)
+
+    # timestamp features (LOCAL)
+    idx = df.index
+    df["minute_of_day"] = idx.hour * 60 + idx.minute
+    df["day_of_week"] = idx.dayofweek
+
+    return df
+
+
+# ==============================
+# BASE STRATEGY SIGNALS (vectorized)
+# ==============================
+
+def build_base_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    o = df["open"]
+    h = df["high"]
+    l = df["low"]
+    c = df["close"]
+
+    body = (c - o).abs()
+    rng = (h - l)
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
+
+    is_bull = c > o
+    is_bear = c < o
+
+    bullish_pinbar = (
+        is_bull &
+        (body > 0) &
+        (lower_wick >= PINBAR_WICK_RATIO * body) &
+        (upper_wick <= PINBAR_MAX_WICK_BODY_RATIO * body)
+    )
+    bearish_pinbar = (
+        is_bear &
+        (body > 0) &
+        (upper_wick >= PINBAR_WICK_RATIO * body) &
+        (lower_wick <= PINBAR_MAX_WICK_BODY_RATIO * body)
+    )
+
+    strong_bull = is_bull & (rng > 0) & ((body / rng) >= STRONG_BODY_MIN_BODY_TO_RANGE)
+    strong_bear = is_bear & (rng > 0) & ((body / rng) >= STRONG_BODY_MIN_BODY_TO_RANGE)
+
+    ema_s = df["ema_short"]
+    ema_l = df["ema_long"]
+    ema200 = df["ema_200"]
+
+    touches = ((l <= ema_s) & (ema_s <= h)) | ((l <= ema_l) & (ema_l <= h))
+
+    dist_9_200 = df["dist_9_200"]
+    ok_ind = ~(ema_s.isna() | ema_l.isna() | ema200.isna() | c.isna())
+
+    long_signal_raw = (
+        ok_ind &
+        df["long_trend"] &
+        touches &
+        (ema_s > ema200) &
+        (dist_9_200 >= EMA_9_200_MIN_DIST) &
+        (c > ema_s) & (c > ema_l) &
+        (bullish_pinbar | strong_bull | is_bull)
+    )
+
+    short_signal_raw = (
+        ok_ind &
+        df["short_trend"] &
+        touches &
+        (ema200 > ema_s) &
+        (dist_9_200 >= EMA_9_200_MIN_DIST) &
+        (c < ema_s) & (c < ema_l) &
+        (bearish_pinbar | strong_bear | is_bear)
+    )
+
+    df["long_signal_raw"] = long_signal_raw.fillna(False)
+    df["short_signal_raw"] = short_signal_raw.fillna(False)
+    print(f"Base signals: long={int(df['long_signal_raw'].sum())}, short={int(df['short_signal_raw'].sum())}")
+    return df
+
+
+# ==============================
+# FILTER MASKS (only what's needed)
+# ==============================
+
+def make_time_filter_masks(minute_of_day: pd.Series) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """
+    Generates time-of-day skip windows including:
+      cal:skip_0100_0700:both
+    """
+    minutes = minute_of_day.to_numpy()
+    n = minutes.shape[0]
+    allow_all = np.ones(n, dtype=np.bool_)
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {"cal:none": (allow_all, allow_all)}
+
+    lengths = [60, 120, 180, 240, 300, 360]
+    starts = list(range(0, 24 * 60, 60))
+    for length in lengths:
+        for start in starts:
+            end = (start + length) % (24 * 60)
+            if end > start:
+                in_window = (minutes >= start) & (minutes < end)
+            else:
+                in_window = (minutes >= start) | (minutes < end)
+
+            base_mask = ~in_window
+            hh1, mm1 = divmod(start, 60)
+            hh2, mm2 = divmod(end, 60)
+            tag = f"cal:skip_{hh1:02d}{mm1:02d}_{hh2:02d}{mm2:02d}"
+
+            out[f"{tag}:both"] = (base_mask, base_mask)
+            out[f"{tag}:long"] = (base_mask, allow_all)
+            out[f"{tag}:short"] = (allow_all, base_mask)
+
+    return out
+
+
+def make_dow_filter_masks(day_of_week: pd.Series) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    dow = day_of_week.to_numpy()
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    out["cal:dow_mon_fri"] = ((dow <= 4), (dow <= 4))
+    out["cal:dow_weekends_only"] = ((dow >= 5), (dow >= 5))
+    names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    for d in range(7):
+        out[f"cal:dow_skip_{names[d]}"] = ((dow != d), (dow != d))
+    return out
+
+
+def build_calendar_map(df: pd.DataFrame) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    cal = make_time_filter_masks(df["minute_of_day"])
+    cal.update(make_dow_filter_masks(df["day_of_week"]))
+    return cal
+
+
+def make_rsi_filter_masks(df: pd.DataFrame) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    n = df.shape[0]
+    allow_all = np.ones(n, dtype=np.bool_)
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {"ind:none": (allow_all, allow_all)}
+
+    rsi_slope = df["rsi_slope"].to_numpy()
+    out["rsi:slope_pos_long_slope_neg_short"] = (rsi_slope > 0, rsi_slope < 0)
+
+    # Additional variants (unused by your fixed filter choice, but harmless)
+    out["rsi:slope_pos_both"] = (rsi_slope > 0, rsi_slope > 0)
+    out["rsi:slope_neg_both"] = (rsi_slope < 0, rsi_slope < 0)
+
+    return out
+
+
+def build_indicator_maps(df: pd.DataFrame) -> Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray]]]:
+    return {"ind:rsi": make_rsi_filter_masks(df)}
+
+
+# ==============================
+# SPLITS
+# ==============================
+
+def compute_train_test_slices(df: pd.DataFrame) -> Tuple[slice, slice]:
+    train_end_dt = (
+        datetime.strptime(TRAIN_END_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+        + timedelta(days=1) - timedelta(seconds=1)
+    )
+    train_end_pos = int(df.index.searchsorted(train_end_dt, side="right"))
+    train_slice = slice(0, train_end_pos)
+    test_slice = slice(train_end_pos, len(df))
+    return train_slice, test_slice
+
+
+# ==============================
+# FAST BACKTEST (Numba) WITH MANAGEMENT
+# ==============================
+
+if njit is not None:
+
+    @njit
+    def _simulate_one_mgmt(
+        open_: np.ndarray,
+        high: np.ndarray,
+        low: np.ndarray,
+        close: np.ndarray,
+        ema_short: np.ndarray,
+        atr: np.ndarray,
+        long_signal: np.ndarray,
+        short_signal: np.ndarray,
+        initial_capital: float,
+        risk_per_trade: float,
+        tp_r_multiple: float,
+        brokerage_half_rate: float,
+        slippage_half_rate: float,
+    ) -> Tuple[float, float, float, float, float, float, float, float, float]:
+        """
+        Returns:
+          total_trades, win_rate, simple_return_pct, compounded_return_pct, max_drawdown_pct,
+          sharpe, profit_factor, avg_return_pct, final_equity
+
+        Implements your exit management settings (trailing chandelier + EMA-against exit).
+        """
+        n = close.shape[0]
+        equity = initial_capital
+        peak_equity = equity
+        max_dd = 0.0  # negative
+
+        total_trades = 0.0
+        wins = 0.0
+        losses = 0.0
+        sum_ret = 0.0
+        compounded = 1.0
+
+        sum_pos_ret = 0.0
+        sum_neg_ret = 0.0
+
+        # sharpe via Welford
+        count = 0.0
+        mean = 0.0
+        m2 = 0.0
+
+        in_trade = False
+        side = 0  # 1 long, -1 short
+
+        entry_price = 0.0
+        stop_loss = 0.0
+        target = 0.0
+        size = 0.0
+        entry_equity = 0.0
+        risk_per_unit = 0.0
+
+        # management state
+        max_fav_r = 0.0
+        ema_against_count = 0
+        hh_since = 0.0
+        ll_since = 0.0
+
+        for i in range(1, n):
+            bar_high = high[i]
+            bar_low = low[i]
+            bar_close = close[i]
+
+            if in_trade:
+                # Update max favourable excursion (R)
+                if risk_per_unit > 0.0:
+                    if side == 1:
+                        fav_r = (bar_high - entry_price) / risk_per_unit
+                    else:
+                        fav_r = (entry_price - bar_low) / risk_per_unit
+                    if fav_r > max_fav_r:
+                        max_fav_r = fav_r
+
+                # 1) Intrabar stop/target (conservative: stop first)
+                exit_price = 0.0
+                hit = 0  # 0 none, 1 stop, 2 target, 3 both=>stop first
+
+                if side == 1:
+                    stop_hit = bar_low <= stop_loss
+                    target_hit = bar_high >= target
+                    if stop_hit and target_hit:
+                        exit_price = stop_loss
+                        hit = 3
+                    elif stop_hit:
+                        exit_price = stop_loss
+                        hit = 1
+                    elif target_hit:
+                        exit_price = target
+                        hit = 2
+                else:
+                    stop_hit = bar_high >= stop_loss
+                    target_hit = bar_low <= target
+                    if stop_hit and target_hit:
+                        exit_price = stop_loss
+                        hit = 3
+                    elif stop_hit:
+                        exit_price = stop_loss
+                        hit = 1
+                    elif target_hit:
+                        exit_price = target
+                        hit = 2
+
+                if hit != 0:
+                    # Apply slippage + fees
+                    if side == 1:
+                        entry_eff = entry_price * (1.0 + slippage_half_rate)
+                        exit_eff = exit_price * (1.0 - slippage_half_rate)
+                        gross_pnl = (exit_eff - entry_eff) * size
+                    else:
+                        entry_eff = entry_price * (1.0 - slippage_half_rate)
+                        exit_eff = exit_price * (1.0 + slippage_half_rate)
+                        gross_pnl = (entry_eff - exit_eff) * size
+
+                    cost_entry = abs(entry_eff * size) * brokerage_half_rate
+                    cost_exit = abs(exit_eff * size) * brokerage_half_rate
+                    net_pnl = gross_pnl - (cost_entry + cost_exit)
+
+                    trade_ret = 0.0
+                    if entry_equity != 0.0:
+                        trade_ret = net_pnl / entry_equity
+
+                    equity = equity * (1.0 + trade_ret)
+
+                    total_trades += 1.0
+                    if net_pnl > 0.0:
+                        wins += 1.0
+                    elif net_pnl < 0.0:
+                        losses += 1.0
+
+                    sum_ret += trade_ret
+                    compounded = compounded * (1.0 + trade_ret)
+                    if trade_ret > 0.0:
+                        sum_pos_ret += trade_ret
+                    elif trade_ret < 0.0:
+                        sum_neg_ret += trade_ret
+
+                    # Welford update
+                    count += 1.0
+                    delta = trade_ret - mean
+                    mean = mean + delta / count
+                    delta2 = trade_ret - mean
+                    m2 = m2 + delta * delta2
+
+                    if equity > peak_equity:
+                        peak_equity = equity
+                    dd = (equity - peak_equity) / peak_equity
+                    if dd < max_dd:
+                        max_dd = dd
+
+                    # reset trade state
+                    in_trade = False
+                    side = 0
+                    ema_against_count = 0
+                    max_fav_r = 0.0
+                    hh_since = 0.0
+                    ll_since = 0.0
+                    continue
+
+                # 2) Early exit (EMA-against): earlyMode=1, lossEMAn=3
+                if EARLY_MODE == 1 and LOSS_EMA_N > 0:
+                    ema_val = ema_short[i]
+                    if side == 1:
+                        if bar_close < ema_val:
+                            ema_against_count += 1
+                        else:
+                            ema_against_count = 0
+                    else:
+                        if bar_close > ema_val:
+                            ema_against_count += 1
+                        else:
+                            ema_against_count = 0
+
+                    if ema_against_count >= LOSS_EMA_N:
+                        exit_price = bar_close
+
+                        if side == 1:
+                            entry_eff = entry_price * (1.0 + slippage_half_rate)
+                            exit_eff = exit_price * (1.0 - slippage_half_rate)
+                            gross_pnl = (exit_eff - entry_eff) * size
+                        else:
+                            entry_eff = entry_price * (1.0 - slippage_half_rate)
+                            exit_eff = exit_price * (1.0 + slippage_half_rate)
+                            gross_pnl = (entry_eff - exit_eff) * size
+
+                        cost_entry = abs(entry_eff * size) * brokerage_half_rate
+                        cost_exit = abs(exit_eff * size) * brokerage_half_rate
+                        net_pnl = gross_pnl - (cost_entry + cost_exit)
+
+                        trade_ret = 0.0
+                        if entry_equity != 0.0:
+                            trade_ret = net_pnl / entry_equity
+
+                        equity = equity * (1.0 + trade_ret)
+
+                        total_trades += 1.0
+                        if net_pnl > 0.0:
+                            wins += 1.0
+                        elif net_pnl < 0.0:
+                            losses += 1.0
+
+                        sum_ret += trade_ret
+                        compounded = compounded * (1.0 + trade_ret)
+                        if trade_ret > 0.0:
+                            sum_pos_ret += trade_ret
+                        elif trade_ret < 0.0:
+                            sum_neg_ret += trade_ret
+
+                        # Welford update
+                        count += 1.0
+                        delta = trade_ret - mean
+                        mean = mean + delta / count
+                        delta2 = trade_ret - mean
+                        m2 = m2 + delta * delta2
+
+                        if equity > peak_equity:
+                            peak_equity = equity
+                        dd = (equity - peak_equity) / peak_equity
+                        if dd < max_dd:
+                            max_dd = dd
+
+                        # reset trade state
+                        in_trade = False
+                        side = 0
+                        ema_against_count = 0
+                        max_fav_r = 0.0
+                        hh_since = 0.0
+                        ll_since = 0.0
+                        continue
+
+                # 3) Trailing stop (Chandelier): trailMode=3, ATR*1.0, start immediately
+                if TRAIL_MODE == 3 and risk_per_unit > 0.0:
+                    atr_val = atr[i]
+                    if atr_val > 0.0:
+                        if side == 1:
+                            if bar_high > hh_since:
+                                hh_since = bar_high
+                            chand_sl = hh_since - TRAIL_ATR_MULT * atr_val
+                            if max_fav_r >= TRAIL_START_R and chand_sl > stop_loss:
+                                stop_loss = chand_sl
+                        else:
+                            if bar_low < ll_since:
+                                ll_since = bar_low
+                            chand_sl = ll_since + TRAIL_ATR_MULT * atr_val
+                            if max_fav_r >= TRAIL_START_R and chand_sl < stop_loss:
+                                stop_loss = chand_sl
+
+            # Entries (if flat)
+            if not in_trade:
+                # LONG entry (prev candle signal)
+                if long_signal[i - 1]:
+                    ep = high[i - 1]
+                    sl = low[i - 1]
+                    rpu = ep - sl
+                    if rpu > 0.0 and bar_high >= ep:
+                        entry_price = ep
+                        stop_loss = sl
+                        risk_per_unit = rpu
+                        entry_equity = equity
+                        risk_amount = entry_equity * risk_per_trade
+                        size = risk_amount / risk_per_unit
+                        target = entry_price + tp_r_multiple * risk_per_unit
+                        side = 1
+                        in_trade = True
+
+                        # init mgmt state
+                        max_fav_r = 0.0
+                        ema_against_count = 0
+                        hh_since = entry_price
+                        ll_since = entry_price
+                        continue
+
+                # SHORT entry (prev candle signal)
+                if short_signal[i - 1]:
+                    ep = low[i - 1]
+                    sl = high[i - 1]
+                    rpu = sl - ep
+                    if rpu > 0.0 and bar_low <= ep:
+                        entry_price = ep
+                        stop_loss = sl
+                        risk_per_unit = rpu
+                        entry_equity = equity
+                        risk_amount = entry_equity * risk_per_trade
+                        size = risk_amount / risk_per_unit
+                        target = entry_price - tp_r_multiple * risk_per_unit
+                        side = -1
+                        in_trade = True
+
+                        # init mgmt state
+                        max_fav_r = 0.0
+                        ema_against_count = 0
+                        hh_since = entry_price
+                        ll_since = entry_price
+                        continue
+
+        # EOD close
+        if in_trade and n > 0:
+            exit_price = close[n - 1]
+            if side == 1:
+                entry_eff = entry_price * (1.0 + slippage_half_rate)
+                exit_eff = exit_price * (1.0 - slippage_half_rate)
+                gross_pnl = (exit_eff - entry_eff) * size
+            else:
+                entry_eff = entry_price * (1.0 - slippage_half_rate)
+                exit_eff = exit_price * (1.0 + slippage_half_rate)
+                gross_pnl = (entry_eff - exit_eff) * size
+
+            cost_entry = abs(entry_eff * size) * brokerage_half_rate
+            cost_exit = abs(exit_eff * size) * brokerage_half_rate
+            net_pnl = gross_pnl - (cost_entry + cost_exit)
+
+            trade_ret = 0.0
+            if entry_equity != 0.0:
+                trade_ret = net_pnl / entry_equity
+
+            equity = equity * (1.0 + trade_ret)
+
+            total_trades += 1.0
+            if net_pnl > 0.0:
+                wins += 1.0
+            elif net_pnl < 0.0:
+                losses += 1.0
+
+            sum_ret += trade_ret
+            compounded = compounded * (1.0 + trade_ret)
+            if trade_ret > 0.0:
+                sum_pos_ret += trade_ret
+            elif trade_ret < 0.0:
+                sum_neg_ret += trade_ret
+
+            count += 1.0
+            delta = trade_ret - mean
+            mean = mean + delta / count
+            delta2 = trade_ret - mean
+            m2 = m2 + delta * delta2
+
+            if equity > peak_equity:
+                peak_equity = equity
+            dd = (equity - peak_equity) / peak_equity
+            if dd < max_dd:
+                max_dd = dd
+
+        # metrics
+        win_rate = 0.0
+        if total_trades > 0.0:
+            win_rate = (wins / total_trades) * 100.0
+
+        simple_return_pct = sum_ret * 100.0
+        compounded_return_pct = (compounded - 1.0) * 100.0
+        max_drawdown_pct = (-max_dd) * 100.0
+
+        sharpe = 0.0
+        if count > 1.0:
+            var = m2 / (count - 1.0)
+            if var > 0.0:
+                std = math.sqrt(var)
+                sharpe = (mean / std) * math.sqrt(252.0)
+
+        profit_factor = 0.0
+        if sum_neg_ret < 0.0:
+            profit_factor = sum_pos_ret / (-sum_neg_ret)
+
+        avg_return_pct = 0.0
+        if total_trades > 0.0:
+            avg_return_pct = (sum_ret / total_trades) * 100.0
+
+        return (
+            total_trades,
+            win_rate,
+            simple_return_pct,
+            compounded_return_pct,
+            max_drawdown_pct,
+            sharpe,
+            profit_factor,
+            avg_return_pct,
+            equity,
+        )
+
+else:
+    def _simulate_one_mgmt(*args, **kwargs):
+        raise RuntimeError("Numba is required. Install: pip install numba")
+
+
+def _fast_metrics(o, h, l, c, ema_s, atr, long_sig, short_sig) -> Dict[str, float]:
+    (
+        total_trades,
+        win_rate,
+        simple_ret_pct,
+        cmpd_ret_pct,
+        max_dd_pct,
+        sharpe,
+        profit_factor,
+        avg_ret_pct,
+        final_equity,
+    ) = _simulate_one_mgmt(
+        o, h, l, c,
+        ema_s, atr,
+        long_sig.astype(np.bool_),
+        short_sig.astype(np.bool_),
+        INITIAL_CAPITAL,
+        RISK_PER_TRADE,
+        TP_R_MULTIPLE,
+        BROKERAGE_HALF_RATE,
+        SLIPPAGE_HALF_RATE,
+    )
+    return {
+        "trades": float(total_trades),
+        "win_rate": float(win_rate),
+        "simple_return_pct": float(simple_ret_pct),
+        "compounded_return_pct": float(cmpd_ret_pct),
+        "max_drawdown_pct": float(max_dd_pct),
+        "sharpe": float(sharpe),
+        "profit_factor": float(profit_factor),
+        "avg_trade_return_pct": float(avg_ret_pct),
+        "final_equity": float(final_equity),
+    }
+
+
+# ==============================
+# STREAKS + PLOT HELPERS
+# ==============================
+
+def compute_max_streaks(trade_returns: pd.Series) -> Tuple[int, int]:
+    """
+    Returns (max_win_streak, max_loss_streak) based on per-trade returns.
+    win  => return > 0
+    loss => return < 0
+    0    => breaks both streaks
+    """
+    max_win = 0
+    max_loss = 0
+    cur_win = 0
+    cur_loss = 0
+
+    for r in trade_returns.fillna(0.0).to_numpy():
+        if r > 0:
+            cur_win += 1
+            cur_loss = 0
+        elif r < 0:
+            cur_loss += 1
+            cur_win = 0
+        else:
+            cur_win = 0
+            cur_loss = 0
+
+        if cur_win > max_win:
+            max_win = cur_win
+        if cur_loss > max_loss:
+            max_loss = cur_loss
+
+    return max_win, max_loss
+
+
+def save_equity_curve_plot(trades_df: pd.DataFrame, path: str) -> None:
+    """
+    Saves a simple equity curve plot from the trade log.
+    Uses exit_time vs equity_after (step-like curve).
+    """
+    if trades_df is None or trades_df.empty:
+        print("Equity curve plot skipped (no trades).")
+        return
+
+    dfp = trades_df.copy()
+    dfp["exit_time"] = pd.to_datetime(dfp["exit_time"])
+    dfp = dfp.sort_values("exit_time")
+
+    x = dfp["exit_time"].to_numpy()
+    y = dfp["equity_after"].to_numpy(dtype=float)
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(x, y)
+    plt.title(f"Equity Curve - {SYMBOL} {TIMEFRAME} (Fixed Filters + Mgmt)")
+    plt.xlabel("Time")
+    plt.ylabel("Equity")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Saved equity curve image: {path}")
+
+
+# ==============================
+# DETAILED TRADE LOG (python) WITH MANAGEMENT
+# ==============================
+
+def backtest_detailed(
+    df: pd.DataFrame,
+    long_signal: pd.Series,
+    short_signal: pd.Series,
+    timeframe: str,
+    calendar_filter: str,
+    side_filter: str,
+    indicator_group: str,
+    indicator_filter: str,
+) -> List[Dict]:
+    trades: List[Dict] = []
+    equity = INITIAL_CAPITAL
+    current_trade = None
+
+    times = df.index.to_list()
+
+    for i in range(1, len(df)):
+        time_i = times[i]
+        row = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        bar_high = float(row["high"])
+        bar_low = float(row["low"])
+        bar_close = float(row["close"])
+        ema9 = float(row["ema_short"]) if not pd.isna(row["ema_short"]) else float("nan")
+        atr = float(row["atr_14"]) if not pd.isna(row["atr_14"]) else float("nan")
+
+        if current_trade is not None:
+            side = current_trade["side"]
+            stop_loss = current_trade["stop_loss"]
+            target = current_trade["target"]
+            entry_price = current_trade["entry_price"]
+            risk_per_unit = current_trade["risk_per_unit"]
+
+            # Update MFE/MAE + max_fav_r
+            if risk_per_unit > 0:
+                if side == "long":
+                    favourable = (bar_high - entry_price) / risk_per_unit
+                    adverse = (entry_price - bar_low) / risk_per_unit
+                else:
+                    favourable = (entry_price - bar_low) / risk_per_unit
+                    adverse = (bar_high - entry_price) / risk_per_unit
+
+                current_trade["mfe_r"] = max(current_trade["mfe_r"], favourable)
+                current_trade["mae_r"] = max(current_trade["mae_r"], adverse)
+                current_trade["max_fav_r"] = max(current_trade["max_fav_r"], favourable)
+
+            exit_price_raw = None
+            exit_reason = None
+
+            # 1) Intrabar stop/target (stop first if both)
+            if side == "long":
+                stop_hit = bar_low <= stop_loss
+                target_hit = bar_high >= target
+                if stop_hit and target_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop+target_same_bar_stop_first"
+                elif stop_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop"
+                elif target_hit:
+                    exit_price_raw = target
+                    exit_reason = "target"
+            else:
+                stop_hit = bar_high >= stop_loss
+                target_hit = bar_low <= target
+                if stop_hit and target_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop+target_same_bar_stop_first"
+                elif stop_hit:
+                    exit_price_raw = stop_loss
+                    exit_reason = "stop"
+                elif target_hit:
+                    exit_price_raw = target
+                    exit_reason = "target"
+
+            # exit helper
+            def _finalize_exit(exit_price: float, reason: str) -> None:
+                nonlocal equity
+                nonlocal current_trade
+
+                side_local = current_trade["side"]
+                entry_price_local = current_trade["entry_price"]
+                size = current_trade["size"]
+                entry_equity = current_trade["equity_at_entry"]
+
+                # slippage
+                if side_local == "long":
+                    entry_price_eff = entry_price_local * (1.0 + SLIPPAGE_HALF_RATE)
+                    exit_price_eff = exit_price * (1.0 - SLIPPAGE_HALF_RATE)
+                    gross_pnl = (exit_price_eff - entry_price_eff) * size
+                else:
+                    entry_price_eff = entry_price_local * (1.0 - SLIPPAGE_HALF_RATE)
+                    exit_price_eff = exit_price * (1.0 + SLIPPAGE_HALF_RATE)
+                    gross_pnl = (entry_price_eff - exit_price_eff) * size
+
+                # brokerage
+                cost_entry = abs(entry_price_eff * size) * BROKERAGE_HALF_RATE
+                cost_exit = abs(exit_price_eff * size) * BROKERAGE_HALF_RATE
+                brokerage_cost = cost_entry + cost_exit
+
+                net_pnl = gross_pnl - brokerage_cost
+                trade_return = net_pnl / entry_equity if entry_equity != 0 else 0.0
+                equity = equity * (1.0 + trade_return)
+
+                r_multiple = trade_return / RISK_PER_TRADE if RISK_PER_TRADE > 0 else 0.0
+
+                trades.append({
+                    "symbol": SYMBOL,
+                    "timeframe": timeframe,
+                    "entry_time": current_trade["entry_time"],
+                    "exit_time": time_i,
+                    "side": side_local,
+                    "entry_price_raw": entry_price_local,
+                    "exit_price_raw": exit_price,
+                    "entry_price_eff": entry_price_eff,
+                    "exit_price_eff": exit_price_eff,
+                    "stop_loss_final": current_trade["stop_loss"],
+                    "target": current_trade["target"],
+                    "size": size,
+                    "risk_per_unit": current_trade["risk_per_unit"],
+                    "mfe_r": current_trade["mfe_r"],
+                    "mae_r": current_trade["mae_r"],
+                    "gross_pnl": gross_pnl,
+                    "brokerage_cost": brokerage_cost,
+                    "pnl": net_pnl,
+                    "return_pct": trade_return * 100.0,
+                    "r_multiple": r_multiple,
+                    "exit_reason": reason,
+                    "equity_after": equity,
+                    # filters + mgmt metadata
+                    "calendar_filter": calendar_filter,
+                    "side_filter": side_filter,
+                    "indicator_group": indicator_group,
+                    "indicator_filter": indicator_filter,
+                    "tpR": TP_R_MULTIPLE,
+                    "beMode": BE_MODE,
+                    "trailMode": TRAIL_MODE,
+                    "trailATR": TRAIL_ATR_MULT,
+                    "trailStartR": TRAIL_START_R,
+                    "earlyMode": EARLY_MODE,
+                    "lossEMAn": LOSS_EMA_N,
+                })
+
+                current_trade = None
+
+            # Apply stop/target exit
+            if exit_price_raw is not None:
+                _finalize_exit(float(exit_price_raw), exit_reason)
+                continue
+
+            # 2) Early exit (EMA-against): 3 consecutive closes against EMA9
+            if EARLY_MODE == 1 and LOSS_EMA_N > 0:
+                if side == "long":
+                    if bar_close < ema9:
+                        current_trade["ema_against_count"] += 1
+                    else:
+                        current_trade["ema_against_count"] = 0
+                else:
+                    if bar_close > ema9:
+                        current_trade["ema_against_count"] += 1
+                    else:
+                        current_trade["ema_against_count"] = 0
+
+                if current_trade["ema_against_count"] >= LOSS_EMA_N:
+                    _finalize_exit(bar_close, f"ema_against_{LOSS_EMA_N}")
+                    continue
+
+            # 3) Trailing stop (Chandelier)
+            if TRAIL_MODE == 3 and risk_per_unit > 0 and atr == atr and atr > 0:
+                if side == "long":
+                    current_trade["hh_since"] = max(current_trade["hh_since"], bar_high)
+                    chand_sl = current_trade["hh_since"] - TRAIL_ATR_MULT * atr
+                    if current_trade["max_fav_r"] >= TRAIL_START_R and chand_sl > current_trade["stop_loss"]:
+                        current_trade["stop_loss"] = chand_sl
+                else:
+                    current_trade["ll_since"] = min(current_trade["ll_since"], bar_low)
+                    chand_sl = current_trade["ll_since"] + TRAIL_ATR_MULT * atr
+                    if current_trade["max_fav_r"] >= TRAIL_START_R and chand_sl < current_trade["stop_loss"]:
+                        current_trade["stop_loss"] = chand_sl
+
+        # New entries based on previous candle
+        if current_trade is None:
+            if bool(long_signal.iloc[i - 1]):
+                entry_price = float(prev_row["high"])
+                stop_loss = float(prev_row["low"])
+                risk_per_unit = entry_price - stop_loss
+                if risk_per_unit > 0 and bar_high >= entry_price:
+                    equity_at_entry = equity
+                    risk_amount = equity_at_entry * RISK_PER_TRADE
+                    size = risk_amount / risk_per_unit
+                    target = entry_price + TP_R_MULTIPLE * risk_per_unit
+                    current_trade = {
+                        "side": "long",
+                        "entry_time": time_i,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target": target,
+                        "size": size,
+                        "equity_at_entry": equity_at_entry,
+                        "risk_per_unit": risk_per_unit,
+                        "mfe_r": 0.0,
+                        "mae_r": 0.0,
+                        "max_fav_r": 0.0,
+                        "ema_against_count": 0,
+                        "hh_since": entry_price,
+                        "ll_since": entry_price,
+                    }
+                    continue
+
+            if bool(short_signal.iloc[i - 1]):
+                entry_price = float(prev_row["low"])
+                stop_loss = float(prev_row["high"])
+                risk_per_unit = stop_loss - entry_price
+                if risk_per_unit > 0 and bar_low <= entry_price:
+                    equity_at_entry = equity
+                    risk_amount = equity_at_entry * RISK_PER_TRADE
+                    size = risk_amount / risk_per_unit
+                    target = entry_price - TP_R_MULTIPLE * risk_per_unit
+                    current_trade = {
+                        "side": "short",
+                        "entry_time": time_i,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "target": target,
+                        "size": size,
+                        "equity_at_entry": equity_at_entry,
+                        "risk_per_unit": risk_per_unit,
+                        "mfe_r": 0.0,
+                        "mae_r": 0.0,
+                        "max_fav_r": 0.0,
+                        "ema_against_count": 0,
+                        "hh_since": entry_price,
+                        "ll_since": entry_price,
+                    }
+                    continue
+
+    # EOD close
+    if current_trade is not None:
+        last_time = times[-1]
+        last_close = float(df.iloc[-1]["close"])
+        side = current_trade["side"]
+        entry_price = current_trade["entry_price"]
+        size = current_trade["size"]
+        entry_equity = current_trade["equity_at_entry"]
+
+        if side == "long":
+            entry_price_eff = entry_price * (1.0 + SLIPPAGE_HALF_RATE)
+            exit_price_eff = last_close * (1.0 - SLIPPAGE_HALF_RATE)
+            gross_pnl = (exit_price_eff - entry_price_eff) * size
+        else:
+            entry_price_eff = entry_price * (1.0 - SLIPPAGE_HALF_RATE)
+            exit_price_eff = last_close * (1.0 + SLIPPAGE_HALF_RATE)
+            gross_pnl = (entry_price_eff - exit_price_eff) * size
+
+        cost_entry = abs(entry_price_eff * size) * BROKERAGE_HALF_RATE
+        cost_exit = abs(exit_price_eff * size) * BROKERAGE_HALF_RATE
+        brokerage_cost = cost_entry + cost_exit
+        net_pnl = gross_pnl - brokerage_cost
+
+        trade_return = net_pnl / entry_equity if entry_equity != 0 else 0.0
+        equity = equity * (1.0 + trade_return)
+        r_multiple = trade_return / RISK_PER_TRADE if RISK_PER_TRADE > 0 else 0.0
+
+        trades.append({
+            "symbol": SYMBOL,
+            "timeframe": timeframe,
+            "entry_time": current_trade["entry_time"],
+            "exit_time": last_time,
+            "side": side,
+            "entry_price_raw": entry_price,
+            "exit_price_raw": last_close,
+            "entry_price_eff": entry_price_eff,
+            "exit_price_eff": exit_price_eff,
+            "stop_loss_final": current_trade["stop_loss"],
+            "target": current_trade["target"],
+            "size": size,
+            "risk_per_unit": current_trade["risk_per_unit"],
+            "mfe_r": current_trade["mfe_r"],
+            "mae_r": current_trade["mae_r"],
+            "gross_pnl": gross_pnl,
+            "brokerage_cost": brokerage_cost,
+            "pnl": net_pnl,
+            "return_pct": trade_return * 100.0,
+            "r_multiple": r_multiple,
+            "exit_reason": "eod",
+            "equity_after": equity,
+            # metadata
+            "calendar_filter": calendar_filter,
+            "side_filter": side_filter,
+            "indicator_group": indicator_group,
+            "indicator_filter": indicator_filter,
+            "tpR": TP_R_MULTIPLE,
+            "beMode": BE_MODE,
+            "trailMode": TRAIL_MODE,
+            "trailATR": TRAIL_ATR_MULT,
+            "trailStartR": TRAIL_START_R,
+            "earlyMode": EARLY_MODE,
+            "lossEMAn": LOSS_EMA_N,
+        })
+
+    return trades
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main() -> None:
+    if njit is None:
+        raise RuntimeError("Numba is required. Install: pip install numba")
+
+    # 1) Fetch data
+    df = fetch_ohlc_from_delta(SYMBOL, TIMEFRAME, START_DATE, END_DATE)
+
+    # 2) Indicators + base signals
+    df = add_indicators(df, resolution=TIMEFRAME)
+    df = build_base_signals(df)
+
+    # 3) Build filter maps
+    calendar_map = build_calendar_map(df)
+    indicator_maps = build_indicator_maps(df)
+
+    # Validate filter keys
+    if CALENDAR_FILTER not in calendar_map:
+        raise KeyError(
+            f"CALENDAR_FILTER='{CALENDAR_FILTER}' not found. Example keys: {list(calendar_map.keys())[:10]} ..."
+        )
+    if INDICATOR_GROUP != "ind:none" and INDICATOR_GROUP not in indicator_maps:
+        raise KeyError(f"INDICATOR_GROUP='{INDICATOR_GROUP}' not found. Available: {list(indicator_maps.keys())}")
+    if INDICATOR_GROUP != "ind:none":
+        if INDICATOR_FILTER not in indicator_maps[INDICATOR_GROUP]:
+            raise KeyError(
+                f"INDICATOR_FILTER='{INDICATOR_FILTER}' not found in group '{INDICATOR_GROUP}'. "
+                f"Available: {list(indicator_maps[INDICATOR_GROUP].keys())}"
+            )
+
+    # 4) Apply filters to base signals
+    long_base = df["long_signal_raw"].to_numpy(dtype=np.bool_)
+    short_base = df["short_signal_raw"].to_numpy(dtype=np.bool_)
+
+    cal_long, cal_short = calendar_map[CALENDAR_FILTER]
+
+    if INDICATOR_GROUP == "ind:none":
+        ind_long = np.ones_like(cal_long, dtype=np.bool_)
+        ind_short = np.ones_like(cal_short, dtype=np.bool_)
+    else:
+        ind_long, ind_short = indicator_maps[INDICATOR_GROUP][INDICATOR_FILTER]
+
+    long_mask = cal_long & ind_long
+    short_mask = cal_short & ind_short
+
+    if SIDE_FILTER == "side:both":
+        pass
+    elif SIDE_FILTER == "side:long_only":
+        short_mask = np.zeros_like(short_mask, dtype=np.bool_)
+    elif SIDE_FILTER == "side:short_only":
+        long_mask = np.zeros_like(long_mask, dtype=np.bool_)
+    else:
+        raise ValueError(f"Unknown SIDE_FILTER: {SIDE_FILTER}")
+
+    long_sig_arr = long_base & long_mask
+    short_sig_arr = short_base & short_mask
+
+    # 5) Metrics (full/train/oos) with management + filtered signals
+    train_slice, oos_slice = compute_train_test_slices(df)
+
+    def seg_metrics(seg: slice) -> Dict[str, float]:
+        sub = df.iloc[seg]
+        if len(sub) < 5:
+            return {
+                "trades": 0.0,
+                "win_rate": 0.0,
+                "simple_return_pct": 0.0,
+                "compounded_return_pct": 0.0,
+                "max_drawdown_pct": 0.0,
+                "sharpe": 0.0,
+                "profit_factor": 0.0,
+                "avg_trade_return_pct": 0.0,
+                "final_equity": INITIAL_CAPITAL,
+            }
+
+        o = sub["open"].to_numpy(np.float64)
+        h = sub["high"].to_numpy(np.float64)
+        l = sub["low"].to_numpy(np.float64)
+        c = sub["close"].to_numpy(np.float64)
+        ema_s = sub["ema_short"].to_numpy(np.float64)
+        atr = sub["atr_14"].to_numpy(np.float64)
+        return _fast_metrics(o, h, l, c, ema_s, atr, long_sig_arr[seg], short_sig_arr[seg])
+
+    full_m = seg_metrics(slice(0, len(df)))
+    train_m = seg_metrics(train_slice)
+    oos_m = seg_metrics(oos_slice)
+
+    # 6) Detailed trade log on FULL range (also used to compute streaks + equity curve)
+    long_sig = pd.Series(long_sig_arr, index=df.index)
+    short_sig = pd.Series(short_sig_arr, index=df.index)
+
+    trades = backtest_detailed(
+        df=df,
+        long_signal=long_sig,
+        short_signal=short_sig,
+        timeframe=TIMEFRAME,
+        calendar_filter=CALENDAR_FILTER,
+        side_filter=SIDE_FILTER,
+        indicator_group=INDICATOR_GROUP,
+        indicator_filter=INDICATOR_FILTER,
+    )
+
+    # Build trades_df (may be empty)
+    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
+
+    # Add segment label (train/oos)
+    train_end_dt = datetime.strptime(TRAIN_END_DATE, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ) + timedelta(days=1) - timedelta(seconds=1)
+    if not trades_df.empty:
+        trades_df["entry_time"] = pd.to_datetime(trades_df["entry_time"])
+        trades_df["exit_time"] = pd.to_datetime(trades_df["exit_time"])
+        trades_df["segment"] = np.where(trades_df["entry_time"] <= train_end_dt, "train", "oos")
+
+    # 7) Streak metrics (computed from trade log)
+    if trades_df.empty:
+        full_max_win_streak = 0
+        full_max_loss_streak = 0
+        train_max_win_streak = 0
+        train_max_loss_streak = 0
+        oos_max_win_streak = 0
+        oos_max_loss_streak = 0
+    else:
+        full_max_win_streak, full_max_loss_streak = compute_max_streaks(trades_df["return_pct"])
+
+        train_df = trades_df[trades_df["segment"] == "train"].copy()
+        oos_df = trades_df[trades_df["segment"] == "oos"].copy()
+
+        train_max_win_streak, train_max_loss_streak = (
+            compute_max_streaks(train_df["return_pct"]) if not train_df.empty else (0, 0)
+        )
+        oos_max_win_streak, oos_max_loss_streak = (
+            compute_max_streaks(oos_df["return_pct"]) if not oos_df.empty else (0, 0)
+        )
+
+    # 8) Metrics table (includes sharpe + streaks)
+    metrics_df = pd.DataFrame([{
+        "symbol": SYMBOL,
+        "timeframe": TIMEFRAME,
+        "initial_capital": INITIAL_CAPITAL,
+        "risk_per_trade": RISK_PER_TRADE,
+
+        "calendar_filter": CALENDAR_FILTER,
+        "side_filter": SIDE_FILTER,
+        "indicator_group": INDICATOR_GROUP,
+        "indicator_filter": INDICATOR_FILTER,
+
+        # management settings
+        "tpR": TP_R_MULTIPLE,
+        "beMode": BE_MODE,
+        "beTrigR": BE_TRIG_R,
+        "beOffR": BE_OFF_R,
+        "trailMode": TRAIL_MODE,
+        "trailStartR": TRAIL_START_R,
+        "trailATR": TRAIL_ATR_MULT,
+        "trailEMAbufATR": TRAIL_EMA_BUF_ATR,
+        "earlyMode": EARLY_MODE,
+        "lossEMAn": LOSS_EMA_N,
+        "timeStop": TIME_STOP_BARS,
+        "cutLossR": CUT_LOSS_R,
+
+        # full metrics
+        "full_trades": full_m["trades"],
+        "full_win_rate": full_m["win_rate"],
+        "full_cmpd_ret_pct": full_m["compounded_return_pct"],
+        "full_max_dd_pct": full_m["max_drawdown_pct"],
+        "full_sharpe": full_m["sharpe"],
+        "full_profit_factor": full_m["profit_factor"],
+        "full_max_win_streak": full_max_win_streak,
+        "full_max_loss_streak": full_max_loss_streak,
+
+        # train metrics
+        "train_trades": train_m["trades"],
+        "train_win_rate": train_m["win_rate"],
+        "train_cmpd_ret_pct": train_m["compounded_return_pct"],
+        "train_max_dd_pct": train_m["max_drawdown_pct"],
+        "train_sharpe": train_m["sharpe"],
+        "train_profit_factor": train_m["profit_factor"],
+        "train_max_win_streak": train_max_win_streak,
+        "train_max_loss_streak": train_max_loss_streak,
+
+        # oos metrics
+        "oos_trades": oos_m["trades"],
+        "oos_win_rate": oos_m["win_rate"],
+        "oos_cmpd_ret_pct": oos_m["compounded_return_pct"],
+        "oos_max_dd_pct": oos_m["max_drawdown_pct"],
+        "oos_sharpe": oos_m["sharpe"],
+        "oos_profit_factor": oos_m["profit_factor"],
+        "oos_max_win_streak": oos_max_win_streak,
+        "oos_max_loss_streak": oos_max_loss_streak,
+
+        # output files
+        "trades_csv": TRADES_CSV_PATH,
+        "equity_plot": EQUITY_PLOT_PATH,
+    }])
+
+    metrics_df.to_csv(METRICS_CSV_PATH, index=False)
+    print("\n=== FILTERED STRATEGY METRICS (WITH MANAGEMENT + STREAKS) ===")
+    print(metrics_df.to_string(index=False))
+    print(f"\nSaved metrics to: {METRICS_CSV_PATH}")
+
+    # 9) Save trades CSV
+    if not trades_df.empty:
+        trades_df.to_csv(TRADES_CSV_PATH, index=False)
+        print(f"\nSaved {len(trades_df)} trades to: {TRADES_CSV_PATH}")
+
+        # 10) Save equity curve image
+        save_equity_curve_plot(trades_df, EQUITY_PLOT_PATH)
+    else:
+        print("\nNo trades produced with the selected filters; trades CSV not saved; equity plot skipped.")
+
+
+if __name__ == "__main__":
+    main()

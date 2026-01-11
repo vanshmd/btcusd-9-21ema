@@ -1,0 +1,952 @@
+import hashlib
+import hmac
+import json
+import time
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Tuple, Optional
+import os
+
+import numpy as np
+import pandas as pd
+import requests
+
+# ==============================
+# CONFIG - EDIT THESE PARAMETERS
+# ==============================
+
+# Backtest date range in *local* timezone (here IST = UTC+5:30)
+START_DATE = "2025-01-01"   # inclusive, format YYYY-MM-DD
+END_DATE   = "2025-12-31"   # inclusive, format YYYY-MM-DD
+
+# Trading instrument and timeframe
+SYMBOL = "BTCUSD"
+RESOLUTION = "1h"  # 1h timeframe as per your strategy
+
+# Local timezone (India)
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))  # IST = UTC+5:30
+
+# Capital & risk
+INITIAL_CAPITAL         = 30000.0   # starting capital
+RISK_PER_TRADE          = 0.01      # risk 1% of equity per trade
+TAKE_PROFIT_R_MULTIPLE  = 2.0       # 1:2 risk-to-reward
+
+# EMA settings (entry timeframe)
+EMA_SHORT = 9
+EMA_LONG  = 15
+
+# Trend / slope settings (1h, tunable) for base EMA trend
+EMA_SLOPE_LOOKBACK      = 3           # candles to look back for slope calculation
+MIN_SLOPE_PCT           = 0.0001      # 0.01% change over lookback to consider "sloping"
+MIN_EMA_SEPARATION_PCT  = 0.0005      # EMAs must be at least 0.05% apart
+CROSS_LOOKBACK          = 5           # bars window to check for EMA crossovers (avoid choppy)
+
+# ================
+# 1H MOMENTUM LAYER
+# ================
+
+# RSI travel filter (your idea)
+RSI_PERIOD             = 14
+RSI_TRAVEL_LOOKBACK    = 10   # bars
+RSI_TRAVEL_MIN_POINTS  = 20.0 # RSI must move at least 20 points over last 10 bars
+
+# Price Rate-of-Change filter
+ROC_LOOKBACK           = 20   # bars
+ROC_MIN_ABS            = 0.025 # 2% move over last 10 bars
+
+# EMA short slope filter (stronger momentum than base trend)
+MOM_EMA_SLOPE_LOOKBACK = 10
+MOM_EMA_SLOPE_MIN      = 0.002 # 0.1% move over 5 bars
+
+# Strong EMA separation filter
+EMA_SEP_STRONG_MIN     = 0.0025 # 0.15% apart
+
+# ATR expansion filter
+ATR_PERIOD             = 14
+ATR_SLOW_PERIOD        = 50
+ATR_EXPANSION_MIN      = 2.5   # ATR fast > 1.5x ATR slow
+
+# Range expansion filter
+RANGE_WINDOW           = 20
+RANGE_EXPANSION_MIN    = 1.4   # bar range > 1.5x median range
+
+# Strong body filter
+BODY_DOM_RATIO_MIN     = 0.6   # body >= 60% of full range
+
+# Volume surge filter
+VOL_WINDOW             = 20
+VOL_SURGE_MIN          = 3.5   # volume > 1.5x median volume
+
+# Pullback/structure filter
+PULLBACK_WINDOW        = 30
+PULLBACK_DIST_MAX      = 0.01  # within 1% of local high/low (shallow pullback)
+
+# Output
+TRADES_CSV_PATH = "btc_ema_scalping_trades_no_lookahead.csv"
+
+# Delta endpoints (India)
+DELTA_BASE_URL = "https://api.india.delta.exchange"
+
+# Optional: API key if you ever want to sign PRIVATE requests.
+# Historical candles endpoint does NOT need authentication.
+API_KEY    = ""
+API_SECRET = ""
+USER_AGENT = "python-ema-backtest"
+
+
+# ==============================
+# DELTA API HELPER
+# ==============================
+
+def generate_signature(secret: str, message: str) -> str:
+    """Generate HMAC SHA256 signature (for private endpoints)."""
+    message_bytes = message.encode("utf-8")
+    secret_bytes  = secret.encode("utf-8")
+    signature = hmac.new(secret_bytes, message_bytes, hashlib.sha256)
+    return signature.hexdigest()
+
+
+def delta_request(
+    method: str,
+    path: str,
+    params: Optional[Dict] = None,
+    payload: Optional[Dict] = None,
+    auth: bool = False,
+) -> Dict:
+    """
+    Generic helper for Delta REST API.
+
+    method: "GET", "POST", ...
+    path:   "/v2/history/candles", etc.
+    params: query parameters
+    payload: JSON body for POST/PUT
+    auth: sign the request (needed only for private endpoints)
+    """
+    url     = f"{DELTA_BASE_URL}{path}"
+    params  = params or {}
+    payload = payload or {}
+
+    # Delta expects JSON body as string
+    payload_str = json.dumps(payload, separators=(",", ":")) if payload else ""
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/json",
+    }
+
+    if auth:
+        if not API_KEY or not API_SECRET:
+            raise RuntimeError("API_KEY/API_SECRET not set but auth=True requested.")
+        timestamp = str(int(time.time()))
+
+        # Build query_string exactly as it will appear in the URL
+        if params:
+            from urllib.parse import urlencode
+            query_string = "?" + urlencode(params, doseq=True)
+        else:
+            query_string = ""
+
+        signature_data = method + timestamp + path + query_string + payload_str
+        signature      = generate_signature(API_SECRET, signature_data)
+
+        headers.update(
+            {
+                "api-key":   API_KEY,
+                "timestamp": timestamp,
+                "signature": signature,
+            }
+        )
+
+    response = requests.request(
+        method=method,
+        url=url,
+        params=params,
+        data=payload_str if method != "GET" else "",
+        timeout=(5, 30),
+        headers=headers,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    # history/candles format: {"success": true, "result": [...], "meta": {...}}
+    if isinstance(data, dict) and "success" in data and not data["success"]:
+        raise RuntimeError(f"Delta API error: {data.get('error')}")
+    return data.get("result", data)
+
+
+# ==============================
+# DATA FETCHING
+# ==============================
+
+def resolution_to_seconds(resolution: str) -> int:
+    """Convert Delta resolution string to seconds."""
+    res  = resolution.strip().lower()
+    unit = res[-1]
+    value = int(res[:-1])
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 60 * 60
+    if unit == "d":
+        return value * 24 * 60 * 60
+    if unit == "w":
+        return value * 7 * 24 * 60 * 60
+    raise ValueError(f"Unsupported resolution: {resolution}")
+
+
+def local_date_range_to_utc_epochs(start_date: str, end_date: str, local_tz) -> Tuple[int, int]:
+    """
+    Convert local START_DATE/END_DATE (e.g. IST) to UTC timestamps for API.
+    We treat the dates as whole days in LOCAL timezone.
+    """
+    local_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=local_tz)
+    local_end   = (
+        datetime.strptime(end_date, "%Y-%m-%d")
+        .replace(tzinfo=local_tz)
+        + timedelta(days=1)
+        - timedelta(seconds=1)
+    )
+    start_utc = local_start.astimezone(timezone.utc)
+    end_utc   = local_end.astimezone(timezone.utc)
+    return int(start_utc.timestamp()), int(end_utc.timestamp())
+
+
+MAX_CANDLES_PER_REQUEST = 4000  # practical chunk size from docs
+
+
+def fetch_ohlc_from_delta(
+    symbol: str,
+    resolution: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles for symbol from Delta Exchange history API
+    over [start_date, end_date] with given resolution.
+
+    START_DATE/END_DATE are interpreted in LOCAL timezone (e.g. IST),
+    but API expects UTC timestamps, so we convert internally.
+
+    Returns DataFrame indexed by LOCAL datetime with columns:
+    open, high, low, close, volume
+    """
+    start_ts, end_ts = local_date_range_to_utc_epochs(start_date, end_date, LOCAL_TZ)
+    res_seconds      = resolution_to_seconds(resolution)
+    max_span         = res_seconds * MAX_CANDLES_PER_REQUEST
+
+    all_records: List[Dict] = []
+
+    print(
+        f"Fetching data from Delta Exchange for {symbol}, {resolution}, "
+        f"{start_date} to {end_date} (LOCAL, {LOCAL_TZ})"
+    )
+
+    current_start = start_ts
+    path          = "/v2/history/candles"
+
+    while current_start < end_ts:
+        current_end = min(current_start + max_span - 1, end_ts)
+        params      = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "start": current_start,
+            "end":   current_end,
+        }
+
+        result = delta_request(
+            method="GET",
+            path=path,
+            params=params,
+            payload=None,
+            auth=False,
+        )
+
+        if not result:
+            break
+
+        all_records.extend(result)
+        current_start = current_end + 1
+
+    if not all_records:
+        raise RuntimeError("No candle data returned from Delta Exchange for given range.")
+
+    df = pd.DataFrame(all_records)
+
+    if "time" not in df.columns:
+        raise RuntimeError(f"Unexpected candle format. Columns: {df.columns.tolist()}")
+
+    # Convert dtypes
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df["time"] = df["time"].dt.tz_convert(LOCAL_TZ)  # convert to LOCAL tz (IST)
+
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+        else:
+            raise RuntimeError(f"Expected column '{col}' not found in candles data.")
+
+    df = df.sort_values("time").set_index("time")
+
+    print(f"Fetched {len(df)} candles from {df.index[0]} to {df.index[-1]} (LOCAL {LOCAL_TZ})")
+    print("First 5 candle times (LOCAL):")
+    print(df.index[:5])
+
+    return df[["open", "high", "low", "close", "volume"]].copy()
+
+
+# ==============================
+# 1H EMAS & TREND
+# ==============================
+
+def add_ema_and_trend(df: pd.DataFrame) -> pd.DataFrame:
+    """Add EMA(9), EMA(15), and trend filters based on slope & EMA separation (1h)."""
+    df = df.copy()
+    df["ema_short"] = df["close"].ewm(span=EMA_SHORT, adjust=False).mean()
+    df["ema_long"]  = df["close"].ewm(span=EMA_LONG,  adjust=False).mean()
+
+    ema_short_prev = df["ema_short"].shift(EMA_SLOPE_LOOKBACK)
+    ema_long_prev  = df["ema_long"].shift(EMA_SLOPE_LOOKBACK)
+
+    slope_short = (df["ema_short"] - ema_short_prev) / ema_short_prev
+    slope_long  = (df["ema_long"]  - ema_long_prev)  / ema_long_prev
+
+    df["slope_short"] = slope_short
+    df["slope_long"]  = slope_long
+
+    df["ema_sep_pct"] = (df["ema_short"] - df["ema_long"]).abs() / df["close"]
+
+    df["ema_diff_sign"] = np.sign(df["ema_short"] - df["ema_long"])
+    df["ema_cross"]     = df["ema_diff_sign"].ne(df["ema_diff_sign"].shift())
+    df["recent_cross"]  = df["ema_cross"].rolling(CROSS_LOOKBACK).max().fillna(0).astype(bool)
+
+    df["long_trend"] = (
+        (df["ema_short"] > df["ema_long"]) &
+        (df["slope_short"] > MIN_SLOPE_PCT) &
+        (df["slope_long"]  > MIN_SLOPE_PCT) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    df["short_trend"] = (
+        (df["ema_short"] < df["ema_long"]) &
+        (df["slope_short"] < -MIN_SLOPE_PCT) &
+        (df["slope_long"]  < -MIN_SLOPE_PCT) &
+        (df["ema_sep_pct"] > MIN_EMA_SEPARATION_PCT) &
+        (~df["recent_cross"])
+    )
+
+    print(f"1H long-trend candles: {df['long_trend'].sum()}, short-trend candles: {df['short_trend'].sum()}")
+    return df
+
+
+# ==============================
+# 1H MOMENTUM INDICATORS (NO LOOKAHEAD)
+# ==============================
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Simple RSI implementation (SMA-based, uses ONLY past closes)."""
+    delta = close.diff()
+    gain  = delta.where(delta > 0, 0.0)
+    loss  = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    return rsi
+
+
+def add_momentum_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add intraday (1h) momentum / structural indicators.
+    All indicators are computed from current and past 1h candles ONLY.
+    Entry still uses previous bar's signal -> no lookahead.
+    """
+    df = df.copy()
+
+    # RSI 14
+    df["rsi_14"] = compute_rsi(df["close"], period=RSI_PERIOD)
+    df["rsi_travel_10"] = df["rsi_14"] - df["rsi_14"].shift(RSI_TRAVEL_LOOKBACK)
+
+    # Price ROC (10-bar)
+    df["roc_10"] = df["close"] / df["close"].shift(ROC_LOOKBACK) - 1.0
+
+    # EMA short slope (5-bar)
+    ema_short_prev_mom = df["ema_short"].shift(MOM_EMA_SLOPE_LOOKBACK)
+    df["ema_short_slope_5"] = (df["ema_short"] - ema_short_prev_mom) / ema_short_prev_mom
+
+    # True range & ATR
+    close_shift = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - close_shift).abs()
+    tr3 = (df["low"]  - close_shift).abs()
+    df["true_range"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr_14"]     = df["true_range"].rolling(ATR_PERIOD).mean()
+    df["atr_slow"]   = df["atr_14"].rolling(ATR_SLOW_PERIOD).mean()
+    df["atr_ratio"]  = df["atr_14"] / df["atr_slow"]
+
+    # Bar range, body, body ratio
+    df["bar_range"]        = df["high"] - df["low"]
+    df["median_range_20"]  = df["bar_range"].rolling(RANGE_WINDOW).median()
+    df["body"]             = (df["close"] - df["open"]).abs()
+    df["body_ratio"]       = df["body"] / df["bar_range"].replace(0, np.nan)
+
+    # Volume stats
+    df["vol_median_20"] = df["volume"].rolling(VOL_WINDOW).median()
+
+    # Pullback extremes
+    df["rolling_high_24"] = df["close"].rolling(PULLBACK_WINDOW).max()
+    df["rolling_low_24"]  = df["close"].rolling(PULLBACK_WINDOW).min()
+    df["dist_from_high"]  = (df["rolling_high_24"] - df["close"]) / df["rolling_high_24"]
+    df["dist_from_low"]   = (df["close"] - df["rolling_low_24"])  / df["rolling_low_24"]
+
+    print("Added 1h RSI, ROC, EMA-slope, ATR, range, body, volume, and pullback indicators.")
+    return df
+
+
+# ==============================
+# CANDLE PATTERNS (1H)
+# ==============================
+
+def candle_stats(row: pd.Series) -> Dict[str, float]:
+    """Return common candle measurements."""
+    o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+    body       = abs(c - o)
+    range_     = h - l
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    return {
+        "body": body,
+        "range": range_,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "is_bull": c > o,
+        "is_bear": c < o,
+    }
+
+
+def is_bullish_pinbar(
+    row: pd.Series,
+    wick_ratio: float = 1.2,
+    max_upper_body_ratio: float = 1.2,
+) -> bool:
+    """Bullish rejection candle: long lower wick, small upper wick, bullish close."""
+    stats = candle_stats(row)
+    if not stats["is_bull"]:
+        return False
+    body = stats["body"]
+    if body == 0:
+        return False
+    lower_wick = stats["lower_wick"]
+    upper_wick = stats["upper_wick"]
+    return (
+        lower_wick >= wick_ratio * body and
+        upper_wick <= max_upper_body_ratio * body
+    )
+
+
+def is_bearish_pinbar(
+    row: pd.Series,
+    wick_ratio: float = 1.2,
+    max_lower_body_ratio: float = 1.2,
+) -> bool:
+    """Bearish rejection candle: long upper wick, small lower wick, bearish close."""
+    stats = candle_stats(row)
+    if not stats["is_bear"]:
+        return False
+    body = stats["body"]
+    if body == 0:
+        return False
+    lower_wick = stats["lower_wick"]
+    upper_wick = stats["upper_wick"]
+    return (
+        upper_wick >= wick_ratio * body and
+        lower_wick <= max_lower_body_ratio * body
+    )
+
+
+def is_strong_bullish_body(row: pd.Series, min_body_to_range: float = 0.4) -> bool:
+    """Full / big bullish body candle."""
+    stats = candle_stats(row)
+    if not stats["is_bull"]:
+        return False
+    if stats["range"] == 0:
+        return False
+    return (stats["body"] / stats["range"]) >= min_body_to_range
+
+
+def is_strong_bearish_body(row: pd.Series, min_body_to_range: float = 0.4) -> bool:
+    """Full / big bearish body candle."""
+    stats = candle_stats(row)
+    if not stats["is_bear"]:
+        return False
+    if stats["range"] == 0:
+        return False
+    return (stats["body"] / stats["range"]) >= min_body_to_range
+
+
+def touches_ema(row: pd.Series) -> bool:
+    """Check if price candle touches either EMA."""
+    l, h = row["low"], row["high"]
+    ema_s, ema_l = row["ema_short"], row["ema_long"]
+    return (l <= ema_s <= h) or (l <= ema_l <= h)
+
+
+# ==============================
+# SIGNAL GENERATION (BASE STRATEGY)
+# ==============================
+
+def build_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build RAW long/short signals from your EMA + candle logic.
+
+    We store:
+      - long_signal_raw / short_signal_raw : base entries
+      - long_signal / short_signal         : default = raw (for base variant)
+
+    NO LOOKAHEAD: each signal is based only on the current bar's information.
+    """
+    df = df.copy()
+    df["long_signal_raw"]  = False
+    df["short_signal_raw"] = False
+
+    long_idx  = df.columns.get_loc("long_signal_raw")
+    short_idx = df.columns.get_loc("short_signal_raw")
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+
+        if np.isnan(row["ema_short"]) or np.isnan(row["ema_long"]):
+            continue
+
+        # LONG SETUP
+        if row["long_trend"] and touches_ema(row):
+            if row["close"] > row["ema_short"] and row["close"] > row["ema_long"]:
+                if (
+                    is_bullish_pinbar(row) or
+                    is_strong_bullish_body(row) or
+                    row["close"] > row["open"]   # generic bullish candle
+                ):
+                    df.iat[i, long_idx] = True
+
+        # SHORT SETUP
+        if row["short_trend"] and touches_ema(row):
+            if row["close"] < row["ema_short"] and row["close"] < row["ema_long"]:
+                if (
+                    is_bearish_pinbar(row) or
+                    is_strong_bearish_body(row) or
+                    row["close"] < row["open"]   # generic bearish candle
+                ):
+                    df.iat[i, short_idx] = True
+
+    print(
+        f"Generated {df['long_signal_raw'].sum()} base long signals and "
+        f"{df['short_signal_raw'].sum()} base short signals."
+    )
+
+    # Default signals = raw (for base variant)
+    df["long_signal"]  = df["long_signal_raw"]
+    df["short_signal"] = df["short_signal_raw"]
+
+    return df
+
+
+# ==============================
+# BACKTEST ENGINE
+# ==============================
+
+def check_exit_for_trade(
+    side: str,
+    stop_loss: float,
+    target: float,
+    bar_high: float,
+    bar_low: float,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Determine if stop or target is hit on this bar.
+
+    Conservative assumption: if both hit in same bar,
+    stop is hit first.
+    """
+    if side == "long":
+        stop_hit   = bar_low  <= stop_loss
+        target_hit = bar_high >= target
+        if stop_hit and target_hit:
+            return stop_loss, "stop+target_same_bar_stop_first"
+        if stop_hit:
+            return stop_loss, "stop"
+        if target_hit:
+            return target, "target"
+    elif side == "short":
+        stop_hit   = bar_high >= stop_loss
+        target_hit = bar_low  <= target
+        if stop_hit and target_hit:
+            return stop_loss, "stop+target_same_bar_stop_first"
+        if stop_hit:
+            return stop_loss, "stop"
+        if target_hit:
+            return target, "target"
+
+    return None, None
+
+
+def backtest_strategy(
+    df: pd.DataFrame,
+) -> Tuple[List[Dict], List[float], List[float]]:
+    """
+    Run EMA scalping strategy backtest on prepared DataFrame.
+
+    Uses df['long_signal'] and df['short_signal'] as entry flags.
+
+    NO LOOKAHEAD:
+      - Signals are generated per bar using only that bar.
+      - Entry happens on the *next* bar if price trades through.
+    """
+    trades: List[Dict]         = []
+    equity_curve: List[float]  = []
+    trade_returns: List[float] = []
+
+    equity        = INITIAL_CAPITAL
+    current_trade = None
+
+    times = df.index.to_list()
+
+    for i in range(1, len(df)):
+        time_i   = times[i]
+        row      = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        bar_high = row["high"]
+        bar_low  = row["low"]
+
+        # 1) Manage open trade
+        if current_trade is not None:
+            side          = current_trade["side"]
+            stop_loss     = current_trade["stop_loss"]
+            target        = current_trade["target"]
+            entry_equity  = current_trade["equity_at_entry"]
+            size          = current_trade["size"]
+            entry_price   = current_trade["entry_price"]
+
+            exit_price, exit_reason = check_exit_for_trade(
+                side=side,
+                stop_loss=stop_loss,
+                target=target,
+                bar_high=bar_high,
+                bar_low=bar_low,
+            )
+
+            if exit_price is not None:
+                if side == "long":
+                    pnl = (exit_price - entry_price) * size
+                else:
+                    pnl = (entry_price - exit_price) * size
+
+                trade_return = pnl / entry_equity if entry_equity != 0 else 0.0
+                equity       = equity * (1.0 + trade_return)
+
+                trade_record = {
+                    "entry_time":  current_trade["entry_time"],
+                    "exit_time":   time_i,
+                    "side":        side,
+                    "entry_price": entry_price,
+                    "exit_price":  exit_price,
+                    "stop_loss":   stop_loss,
+                    "target":      target,
+                    "size":        size,
+                    "pnl":         pnl,
+                    "return_pct":  trade_return * 100.0,
+                    "exit_reason": exit_reason,
+                }
+                trades.append(trade_record)
+                equity_curve.append(equity)
+                trade_returns.append(trade_return)
+
+                current_trade = None
+                continue  # do not open another trade on same bar
+
+        # 2) No open trade: check new entries based on previous candle's signal
+        if current_trade is None:
+            # LONG ENTRY (based on previous bar)
+            if prev_row["long_signal"]:
+                entry_price   = prev_row["high"]
+                stop_loss     = prev_row["low"]
+                risk_per_unit = entry_price - stop_loss
+                if risk_per_unit > 0 and bar_high >= entry_price:
+                    equity_at_entry = equity
+                    risk_amount     = equity_at_entry * RISK_PER_TRADE
+                    size            = risk_amount / risk_per_unit
+                    target          = entry_price + TAKE_PROFIT_R_MULTIPLE * risk_per_unit
+
+                    current_trade = {
+                        "side": "long",
+                        "entry_time": time_i,
+                        "entry_price": entry_price,
+                        "stop_loss":  stop_loss,
+                        "target":     target,
+                        "size":       size,
+                        "equity_at_entry": equity_at_entry,
+                    }
+                    continue
+
+            # SHORT ENTRY (based on previous bar)
+            if prev_row["short_signal"]:
+                entry_price   = prev_row["low"]
+                stop_loss     = prev_row["high"]
+                risk_per_unit = stop_loss - entry_price
+                if risk_per_unit > 0 and bar_low <= entry_price:
+                    equity_at_entry = equity
+                    risk_amount     = equity_at_entry * RISK_PER_TRADE
+                    size            = risk_amount / risk_per_unit
+                    target          = entry_price - TAKE_PROFIT_R_MULTIPLE * risk_per_unit
+
+                    current_trade = {
+                        "side": "short",
+                        "entry_time":  time_i,
+                        "entry_price": entry_price,
+                        "stop_loss":   stop_loss,
+                        "target":      target,
+                        "size":        size,
+                        "equity_at_entry": equity_at_entry,
+                    }
+                    continue
+
+    return trades, equity_curve, trade_returns
+
+
+# ==============================
+# PERFORMANCE METRICS
+# ==============================
+
+def compute_performance_metrics(
+    trades: List[Dict],
+    equity_curve: List[float],
+    trade_returns: List[float],
+    initial_capital: float,
+) -> Dict[str, float]:
+    """Compute win rate, loss rate, returns, drawdown, Sharpe."""
+    metrics = {
+        "total_trades":          0,
+        "win_rate":              0.0,
+        "loss_rate":             0.0,
+        "simple_return_pct":     0.0,
+        "compounded_return_pct": 0.0,
+        "max_drawdown_pct":      0.0,
+        "sharpe_ratio":          0.0,
+    }
+
+    total_trades = len(trades)
+    metrics["total_trades"] = total_trades
+
+    if total_trades == 0 or len(trade_returns) == 0:
+        return metrics
+
+    wins   = sum(1 for t in trades if t["pnl"] > 0)
+    losses = sum(1 for t in trades if t["pnl"] < 0)
+
+    metrics["win_rate"]  = 100.0 * wins   / total_trades
+    metrics["loss_rate"] = 100.0 * losses / total_trades
+
+    simple_return     = float(np.sum(trade_returns))
+    compounded_return = float(np.prod([1.0 + r for r in trade_returns]) - 1.0)
+
+    metrics["simple_return_pct"]     = simple_return * 100.0
+    metrics["compounded_return_pct"] = compounded_return * 100.0
+
+    if equity_curve:
+        eq        = np.array([initial_capital] + equity_curve)
+        peak      = np.maximum.accumulate(eq)
+        drawdowns = (eq - peak) / peak
+        max_dd    = drawdowns.min()
+        metrics["max_drawdown_pct"] = -max_dd * 100.0
+
+    returns_arr = np.array(trade_returns)
+    mean_ret    = returns_arr.mean()
+    std_ret     = returns_arr.std(ddof=1) if len(returns_arr) > 1 else 0.0
+    if std_ret > 0:
+        metrics["sharpe_ratio"] = float(mean_ret / std_ret * np.sqrt(252))
+
+    return metrics
+
+
+# ==============================
+# MULTIPLE VARIANTS (10 MOMENTUM / STRUCTURAL FILTERS)
+# ==============================
+
+def run_all_variants(df: pd.DataFrame) -> None:
+    """
+    Build several filtered variants on top of the same base entry signals,
+    run backtest for each, and print / save their results.
+
+    Each variant adds ONE extra 1h momentum/structure filter.
+    """
+    base_name, ext = os.path.splitext(TRADES_CSV_PATH)
+    if not ext:
+        ext = ".csv"
+
+    base_long  = df["long_signal_raw"].fillna(False)
+    base_short = df["short_signal_raw"].fillna(False)
+
+    # 1) RSI travel filter (your idea: RSI moves 20+ points in last 10 bars)
+    rsi_travel_up   = (df["rsi_travel_10"] >=  RSI_TRAVEL_MIN_POINTS)
+    rsi_travel_down = (df["rsi_travel_10"] <= -RSI_TRAVEL_MIN_POINTS)
+
+    # 2) Price ROC filter
+    roc_long  = df["roc_10"] >=  ROC_MIN_ABS
+    roc_short = df["roc_10"] <= -ROC_MIN_ABS
+
+    # 3) EMA short slope (5-bar momentum)
+    ema_slope_long  = df["ema_short_slope_5"] >=  MOM_EMA_SLOPE_MIN
+    ema_slope_short = df["ema_short_slope_5"] <= -MOM_EMA_SLOPE_MIN
+
+    # 4) Strong EMA separation
+    ema_sep_strong = df["ema_sep_pct"] >= EMA_SEP_STRONG_MIN
+
+    # 5) ATR expansion
+    atr_expansion = df["atr_ratio"] >= ATR_EXPANSION_MIN
+
+    # 6) Range expansion bar
+    range_expansion = df["bar_range"] > (df["median_range_20"] * RANGE_EXPANSION_MIN)
+
+    # 7) Strong body (marubozu-style)
+    strong_body_bull = (df["body_ratio"] >= BODY_DOM_RATIO_MIN) & (df["close"] > df["open"])
+    strong_body_bear = (df["body_ratio"] >= BODY_DOM_RATIO_MIN) & (df["close"] < df["open"])
+
+    # 8) Volume surge
+    vol_surge = df["volume"] > (df["vol_median_20"] * VOL_SURGE_MIN)
+
+    # 9) Structural HH-HL / LL-LH based only on past 3 closes/highs/lows
+    hh = (df["close"] > df["close"].shift(1)) & (df["close"].shift(1) > df["close"].shift(2))
+    hl = (df["low"]   > df["low"].shift(1))   & (df["low"].shift(1)   > df["low"].shift(2))
+    struct_long = hh & hl
+
+    ll = (df["close"] < df["close"].shift(1)) & (df["close"].shift(1) < df["close"].shift(2))
+    lh = (df["high"]  < df["high"].shift(1))  & (df["high"].shift(1)  < df["high"].shift(2))
+    struct_short = ll & lh
+
+    # 10) Near local extreme (shallow pullback)
+    near_high = df["dist_from_high"] <= PULLBACK_DIST_MAX
+    near_low  = df["dist_from_low"]  <= PULLBACK_DIST_MAX
+
+    variants = {
+        "base": {
+            "description": "Original EMA strategy, no extra 1h momentum filter",
+            "long_mask": base_long,
+            "short_mask": base_short,
+        },
+        "rsi_travel": {
+            "description": f"RSI14 moved >= {RSI_TRAVEL_MIN_POINTS} points in last {RSI_TRAVEL_LOOKBACK} bars",
+            "long_mask": base_long  & rsi_travel_up.fillna(False),
+            "short_mask": base_short & rsi_travel_down.fillna(False),
+        },
+        "roc_10": {
+            "description": f"Price ROC({ROC_LOOKBACK}) >= {ROC_MIN_ABS:.2%} for longs, <= -{ROC_MIN_ABS:.2%} for shorts",
+            "long_mask": base_long  & roc_long.fillna(False),
+            "short_mask": base_short & roc_short.fillna(False),
+        },
+        "ema_slope_5": {
+            "description": f"EMA({EMA_SHORT}) 5-bar slope > {MOM_EMA_SLOPE_MIN:.4f} for longs, <-{MOM_EMA_SLOPE_MIN:.4f} for shorts",
+            "long_mask": base_long  & ema_slope_long.fillna(False),
+            "short_mask": base_short & ema_slope_short.fillna(False),
+        },
+        "ema_sep_strong": {
+            "description": f"Strong EMA separation >= {EMA_SEP_STRONG_MIN:.4f}",
+            "long_mask": base_long  & ema_sep_strong.fillna(False),
+            "short_mask": base_short & ema_sep_strong.fillna(False),
+        },
+        "atr_expansion": {
+            "description": f"ATR ratio >= {ATR_EXPANSION_MIN:.2f} (volatility expansion)",
+            "long_mask": base_long  & atr_expansion.fillna(False),
+            "short_mask": base_short & atr_expansion.fillna(False),
+        },
+        "range_expansion": {
+            "description": f"Bar range > {RANGE_EXPANSION_MIN:.2f}x median range({RANGE_WINDOW})",
+            "long_mask": base_long  & range_expansion.fillna(False),
+            "short_mask": base_short & range_expansion.fillna(False),
+        },
+        "strong_body": {
+            "description": f"Body >= {BODY_DOM_RATIO_MIN:.0%} of full range",
+            "long_mask": base_long  & strong_body_bull.fillna(False),
+            "short_mask": base_short & strong_body_bear.fillna(False),
+        },
+        "vol_surge": {
+            "description": f"Volume > {VOL_SURGE_MIN:.2f}x median volume({VOL_WINDOW})",
+            "long_mask": base_long  & vol_surge.fillna(False),
+            "short_mask": base_short & vol_surge.fillna(False),
+        },
+        "structure_hh_hl": {
+            "description": "Higher highs & higher lows for longs, lower lows & lower highs for shorts (3-bar structure)",
+            "long_mask": base_long  & struct_long.fillna(False),
+            "short_mask": base_short & struct_short.fillna(False),
+        },
+        "near_extreme": {
+            "description": f"Price within {PULLBACK_DIST_MAX:.0%} of {PULLBACK_WINDOW}-bar high (longs) / low (shorts)",
+            "long_mask": base_long  & near_high.fillna(False),
+            "short_mask": base_short & near_low.fillna(False),
+        },
+    }
+
+    print("\n========== VARIANT RESULTS ==========")
+
+    for name, spec in variants.items():
+        print(f"\n--- Variant: {name} ---")
+        print(spec["description"])
+
+        df_var = df.copy()
+        df_var["long_signal"]  = spec["long_mask"]
+        df_var["short_signal"] = spec["short_mask"]
+
+        trades, equity_curve, trade_returns = backtest_strategy(df_var)
+        metrics = compute_performance_metrics(
+            trades=trades,
+            equity_curve=equity_curve,
+            trade_returns=trade_returns,
+            initial_capital=INITIAL_CAPITAL,
+        )
+
+        if trades:
+            trades_df = pd.DataFrame(trades)
+            trades_path = f"{base_name}_{name}{ext}"
+            trades_df.to_csv(trades_path, index=False)
+            print(f"Saved {len(trades)} trades to {trades_path}")
+        else:
+            print("No trades for this variant.")
+
+        print(f"Total trades: {metrics['total_trades']}")
+        print(f"Win rate: {metrics['win_rate']:.2f}%")
+        print(f"Loss rate: {metrics['loss_rate']:.2f}%")
+        print(f"Simple return (sum of per-trade %): {metrics['simple_return_pct']:.2f}%")
+        print(f"Compounded return: {metrics['compounded_return_pct']:.2f}%")
+        print(f"Max drawdown: {metrics['max_drawdown_pct']:.2f}%")
+        print(f"Sharpe ratio (per trade, annualised): {metrics['sharpe_ratio']:.2f}")
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main():
+    # 1. Fetch data (IST date range)
+    df = fetch_ohlc_from_delta(
+        symbol=SYMBOL,
+        resolution=RESOLUTION,
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
+
+    # 2. 1h EMAs + trend
+    df = add_ema_and_trend(df)
+
+    # 3. 1h momentum / structural indicators (no daily, no lookahead)
+    df = add_momentum_indicators(df)
+
+    # 4. Base entry signals (no filters yet)
+    df = build_signals(df)
+
+    # 5. Run multiple variants & show their individual results
+    run_all_variants(df)
+
+
+if __name__ == "__main__":
+    main()
